@@ -3,7 +3,7 @@
 faithBOT · cloud helper (runs on GitHub, every 30 minutes; no Mac needed).
 
 1. Telegram: watches the church's channels with your Telegram account (the same rules as the Mac helper). A new main video
-   that is too big for faithBOT to fetch itself is downloaded, turned into a small MP3 and put straight into
+   that faithBOT can't fetch itself (too big, in a private group, or a VK / YouTube link in the post) is downloaded, turned into a small MP3 and put straight into
    Google Drive → faithBOT → Входящие → <kind>. faithBOT then makes the notes as usual.
 2. SoundCloud: KingdomCity Dubai sermons too big for Google to fetch (for you and Diana only).
 3. YouTube: the videos faithBOT is waiting for (the Кафедра, the ministries) are fetched as audio only and put next to
@@ -80,6 +80,56 @@ def upload(path, name, **where):
     return False
 
 
+LINK_RE = re.compile(r'https?://(?:www\.|m\.)?(?:vk\.com/(?:video|clip)|vkvideo\.ru/(?:video|clip)|vk\.ru/video|youtube\.com/(?:watch|live)|youtu\.be/)\S*', re.I)
+
+
+def post_link(msg):
+    """The VK or YouTube video a post points to (the church posts its morning word as a VK Video link)."""
+    urls = []
+    for e in msg.entities or []:
+        if getattr(e, 'url', None):
+            urls.append(e.url)
+    text = msg.message or ''
+    for e in msg.entities or []:
+        if type(e).__name__ == 'MessageEntityUrl':
+            urls.append(text[e.offset:e.offset + e.length])
+    wp = getattr(getattr(msg, 'media', None), 'webpage', None)
+    if getattr(wp, 'url', None):
+        urls.append(wp.url)
+    urls += re.findall(r'https?://\S+', text)
+    return next((u for u in urls if LINK_RE.match(u)), None)
+
+
+def link_audio(url):
+    """Downloads only the sound of a VK or YouTube video with yt-dlp. Returns the file, or None."""
+    if not getattr(link_audio, 'ready', False):
+        subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', '-U', 'yt-dlp'], check=False)
+        link_audio.ready = True
+    for f in glob.glob(os.path.join(TMP, 'lk.*')):
+        os.remove(f)
+    r = subprocess.run([sys.executable, '-m', 'yt_dlp', '-q', '--no-playlist', '-f', 'bestaudio/best', '-o', os.path.join(TMP, 'lk.%(ext)s'), url],
+                       capture_output=True, text=True)
+    got = [f for f in glob.glob(os.path.join(TMP, 'lk.*')) if not f.endswith('.part')]
+    if r.returncode != 0 or not got:
+        log('· could not download', url, (r.stderr or '').strip()[-200:])
+        return None
+    return got[0]
+
+
+async def post_audio(msg, out):
+    """The post's video (uploaded to Telegram, or a VK / YouTube link) as a small MP3 in `out`. True when done."""
+    if msg.video:
+        src = await msg.download_media(file=TMP + '/')
+    else:
+        link = post_link(msg)
+        src = link_audio(link) if link else None
+    if not src:
+        return False
+    ok = to_mp3(src, out)
+    os.remove(src)
+    return ok
+
+
 def clean(s):
     s = re.sub(r"['’‘`]", '', s or '')
     s = re.sub(r'[_\\/:*?"<>|«»“”#%&{}$!@=+^~\[\]]', ' ', s)
@@ -117,12 +167,12 @@ async def telegram(state):
                     continue
                 age_days = (time.time() - msg.date.timestamp()) / 86400
                 text = msg.message or ''
-                if age_days > RECENT_DAYS or not msg.video or not need.search(text) or skip.search(text):
+                if age_days > RECENT_DAYS or not (msg.video or post_link(msg)) or not need.search(text) or skip.search(text):
                     if age_days > RECENT_DAYS or first:
                         new_seen.append(key)
                     continue
-                dur = next((a.duration for a in (msg.document.attributes or []) if hasattr(a, 'duration')), 0)
-                size_mb = (msg.file.size or 0) / 1048576
+                dur = next((a.duration for a in (msg.document.attributes or []) if hasattr(a, 'duration')), 0) if msg.video else 0
+                size_mb = (msg.file.size or 0) / 1048576 if msg.video else 999  # a link: faithBOT can't fetch VK itself
                 if dur and dur < src['min'] * 60:
                     new_seen.append(key)
                     continue
@@ -131,13 +181,12 @@ async def telegram(state):
                     new_seen.append(key)
                     continue
                 title, date = details(text, msg.date)
-                log('⬇️', key, title, '%.0f MB' % size_mb)
-                video = await msg.download_media(file=TMP + '/')
+                log('⬇️', key, title, '%.0f MB' % size_mb if msg.video else post_link(msg))
                 mp3 = os.path.join(TMP, 'tg.mp3')
-                ok = to_mp3(video, mp3)
-                os.remove(video)
+                ok = await post_audio(msg, mp3)
                 if not ok:
-                    tell('⚠️ could not convert %s «%s»' % (src['kind'], title), notify=True)
+                    tell('⚠️ could not fetch %s «%s» %s: put its MP3 in Drive → faithBOT → Входящие' % (src['folder'], title, date), notify=True)
+                    new_seen.append(key)  # told once, not every 30 minutes
                     continue
                 res = upload(mp3, '%s %s.mp3' % (title, date.replace('.', '-')), dest='tg', kind=src['kind'], date=date)
                 os.remove(mp3)
@@ -177,17 +226,15 @@ async def backlog(client, state):
                 break
             pos[ch] = msg.id
             text = msg.message or ''
-            if not msg.video or not need.search(text) or skip.search(text):
+            if not (msg.video or post_link(msg)) or not need.search(text) or skip.search(text):
                 continue
-            dur = next((a.duration for a in (msg.document.attributes or []) if hasattr(a, 'duration')), 0)
+            dur = next((a.duration for a in (msg.document.attributes or []) if hasattr(a, 'duration')), 0) if msg.video else 0
             if dur and dur < src['min'] * 60:
                 continue
             title, date = details(text, msg.date)
             log('📚', ch, msg.id, title, date)
-            video = await msg.download_media(file=TMP + '/')
             mp3 = os.path.join(TMP, 'bl.mp3')
-            ok = to_mp3(video, mp3)
-            os.remove(video)
+            ok = await post_audio(msg, mp3)
             if ok and upload(mp3, '%s %s.mp3' % (title, date), dest='archive', kind=src['kind'], date=date) is True:
                 n += 1
             if os.path.exists(mp3):
