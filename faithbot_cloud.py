@@ -132,9 +132,11 @@ async def post_audio(msg, out, client=None):
     """The post's video (uploaded to Telegram, or a VK / YouTube link) as a small MP3 in `out`. True when done."""
     first = await main_video(client, msg) if client and msg.grouped_id else (msg if msg.video else None)
     if first:
+        log('  · from the Telegram video (%.0f MB)' % ((first.file.size or 0) / 1048576))
         src = await first.download_media(file=TMP + '/')
     else:
         link = post_link(msg)
+        log('  · from the link', link)
         src = link_audio(link) if link else None
     if not src:
         return False
@@ -177,7 +179,7 @@ async def telegram(state):
         for src in state.get('sources') or []:
             ch, need, skip = src['ch'], re.compile(src['need'], re.I), re.compile(src['skip'], re.I)
             entity = await client.get_entity(int(ch) if re.match(r'^-?\d+$', str(ch)) else ch)
-            async for msg in client.iter_messages(entity, limit=12, reply_to=src.get('topic') or None):
+            async for msg in client.iter_messages(entity, limit=60 if src.get('priv') else 12, reply_to=src.get('topic') or None):  # a busy group: look further back
                 key = '%s/%s' % (ch, msg.grouped_id or msg.id)
                 if key in seen:
                     continue
