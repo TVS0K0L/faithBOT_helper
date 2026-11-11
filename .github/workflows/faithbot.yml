@@ -1,0 +1,26 @@
+# faithBOT · cloud helper: every 30 minutes GitHub runs faithbot_cloud.py for you (no Mac needed).
+name: faithBOT helper
+on:
+  schedule:
+    - cron: '7,37 * * * *'   # every 30 minutes (GitHub may start it a few minutes late)
+  workflow_dispatch:          # the "Run workflow" button, to try it at once
+concurrency:
+  group: faithbot-helper
+  cancel-in-progress: false
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -q telethon requests
+      - run: python faithbot_cloud.py
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_SESSION: ${{ secrets.TG_SESSION }}
+          FAITHBOT_URL: ${{ secrets.FAITHBOT_URL }}
+          FAITHBOT_KEY: ${{ secrets.FAITHBOT_KEY }}
