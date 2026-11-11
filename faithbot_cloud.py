@@ -116,10 +116,23 @@ def link_audio(url):
     return got[0]
 
 
-async def post_audio(msg, out):
+async def main_video(client, msg):
+    """A post of several videos (e.g. «Тема: … + форум»: the lesson, then the forum) shares one caption.
+    The lesson is always the FIRST video of the group, whichever one carries the caption."""
+    if not msg.grouped_id:
+        return msg if msg.video else None
+    near = await client.get_messages(msg.peer_id, ids=list(range(msg.id - 9, msg.id + 10)))
+    vids = sorted([m for m in near if m and m.grouped_id == msg.grouped_id and m.video], key=lambda m: m.id)
+    if len(vids) > 1:
+        log('· %d videos in this post: taking the first (%s min), not the forum' % (len(vids), round((vids[0].file.duration or 0) / 60) if hasattr(vids[0].file, 'duration') else '?'))
+    return vids[0] if vids else None
+
+
+async def post_audio(msg, out, client=None):
     """The post's video (uploaded to Telegram, or a VK / YouTube link) as a small MP3 in `out`. True when done."""
-    if msg.video:
-        src = await msg.download_media(file=TMP + '/')
+    first = await main_video(client, msg) if client and msg.grouped_id else (msg if msg.video else None)
+    if first:
+        src = await first.download_media(file=TMP + '/')
     else:
         link = post_link(msg)
         src = link_audio(link) if link else None
@@ -139,6 +152,9 @@ def clean(s):
 def details(text, date):
     title = (re.search(r'«([^»]+)»', text or '') or [None, ''])[1] or (text or '').split('\n')[0]
     title = re.sub(r'\s*\+\s*форум.*$', '', title, flags=re.I).strip()
+    part = re.search(r'»\s*\((\d+)\)', text or '')
+    if part:
+        title += ' (%s)' % part[1]
     m = re.search(r'(?:Запись от|от)\s*(\d{1,2})\.(\d{1,2})\.(\d{4})', text or '')
     if m:
         return clean(title), '%02d.%02d.%s' % (int(m[1]), int(m[2]), m[3])
@@ -183,7 +199,7 @@ async def telegram(state):
                 title, date = details(text, msg.date)
                 log('⬇️', key, title, '%.0f MB' % size_mb if msg.video else post_link(msg))
                 mp3 = os.path.join(TMP, 'tg.mp3')
-                ok = await post_audio(msg, mp3)
+                ok = await post_audio(msg, mp3, client)
                 if not ok:
                     tell('⚠️ could not fetch %s «%s» %s: put its MP3 in Drive → faithBOT → Входящие' % (src['folder'], title, date), notify=True)
                     new_seen.append(key)  # told once, not every 30 minutes
@@ -234,7 +250,7 @@ async def backlog(client, state):
             title, date = details(text, msg.date)
             log('📚', ch, msg.id, title, date)
             mp3 = os.path.join(TMP, 'bl.mp3')
-            ok = await post_audio(msg, mp3)
+            ok = await post_audio(msg, mp3, client)
             if ok and upload(mp3, '%s %s.mp3' % (title, date), dest='archive', kind=src['kind'], date=date) is True:
                 n += 1
             if os.path.exists(mp3):
