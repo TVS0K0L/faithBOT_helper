@@ -21,6 +21,8 @@ KEY = os.environ.get('FAITHBOT_KEY', '').strip()
 MIN_MB = 45          # smaller videos faithBOT fetches from the channel itself
 RECENT_DAYS = 3      # only posts this new are considered
 TMP = tempfile.mkdtemp(prefix='faithbot-')
+STARTED = time.time()
+BUDGET_MIN = 32       # the backlog stops after this many minutes of a run (GitHub allows 45)
 
 
 def log(*a):
@@ -104,9 +106,12 @@ async def telegram(state):
     first = not seen
     new_seen = []
     async with TelegramClient(StringSession(session), int(api_id), api_hash) as client:
+        if any(s.get('priv') for s in state.get('sources') or []):
+            await client.get_dialogs()  # private groups are known by number only after this
         for src in state.get('sources') or []:
             ch, need, skip = src['ch'], re.compile(src['need'], re.I), re.compile(src['skip'], re.I)
-            async for msg in client.iter_messages(ch, limit=12):
+            entity = await client.get_entity(int(ch) if re.match(r'^-?\d+$', str(ch)) else ch)
+            async for msg in client.iter_messages(entity, limit=12, reply_to=src.get('topic') or None):
                 key = '%s/%s' % (ch, msg.grouped_id or msg.id)
                 if key in seen:
                     continue
@@ -121,7 +126,7 @@ async def telegram(state):
                 if dur and dur < src['min'] * 60:
                     new_seen.append(key)
                     continue
-                if size_mb < MIN_MB:
+                if size_mb < MIN_MB and not src.get('priv'):  # faithBOT can't open a private group itself
                     log('·', key, '%.0f MB: faithBOT fetches it itself' % size_mb)
                     new_seen.append(key)
                     continue
@@ -140,8 +145,59 @@ async def telegram(state):
                     new_seen.append(key)
                     if res is True:
                         tell('✅ %s «%s» %s → Drive' % (src['folder'], title, date))
-    if new_seen:
-        bot('seen', posts=new_seen)
+        if new_seen:
+            bot('seen', posts=new_seen)
+        await backlog(client, state)
+
+
+async def backlog(client, state):
+    """/backlog in faithBOT: every Горница and morning word from before the cutoff, newest first, into faithBOT/Архив.
+    A run stops after BUDGET_MIN minutes; the next one goes on from where it stopped."""
+    bl = state.get('backlog')
+    if not bl:
+        return
+    from datetime import datetime
+    before = datetime.fromisoformat(bl['before'].replace('Z', '+00:00'))
+    pos, done = dict(bl.get('pos') or {}), set(bl.get('done') or [])
+    for src in state.get('sources') or []:
+        ch = str(src['ch'])
+        if ch in done:
+            continue
+        need, skip = re.compile(src['need'], re.I), re.compile(src['skip'], re.I)
+        entity = await client.get_entity(int(ch) if re.match(r'^-?\d+$', ch) else ch)
+        kw = {'reply_to': src.get('topic') or None}
+        if pos.get(ch):
+            kw['offset_id'] = int(pos[ch])
+        else:
+            kw['offset_date'] = before
+        n, finished = 0, True
+        async for msg in client.iter_messages(entity, **kw):
+            if (time.time() - STARTED) / 60 > BUDGET_MIN:
+                finished = False
+                break
+            pos[ch] = msg.id
+            text = msg.message or ''
+            if not msg.video or not need.search(text) or skip.search(text):
+                continue
+            dur = next((a.duration for a in (msg.document.attributes or []) if hasattr(a, 'duration')), 0)
+            if dur and dur < src['min'] * 60:
+                continue
+            title, date = details(text, msg.date)
+            log('📚', ch, msg.id, title, date)
+            video = await msg.download_media(file=TMP + '/')
+            mp3 = os.path.join(TMP, 'bl.mp3')
+            ok = to_mp3(video, mp3)
+            os.remove(video)
+            if ok and upload(mp3, '%s %s.mp3' % (title, date), dest='archive', kind=src['kind'], date=date) is True:
+                n += 1
+            if os.path.exists(mp3):
+                os.remove(mp3)
+            bot('blseen', pos={ch: msg.id}, n=1 if ok else 0)
+        bot('blseen', pos={ch: pos.get(ch, 0)}, done=[ch] if finished else [], n=0)
+        if n:
+            tell('📚 %s: %d older recordings → faithBOT/Архив%s' % (src['folder'], n, '' if finished else ' (more next run)'))
+        if not finished:
+            return
 
 
 def youtube(state):
