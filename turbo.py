@@ -297,7 +297,7 @@ async def telegram(cfg, have):
     totals = {}
     async with TelegramClient(StringSession(os.environ['TG_SESSION']), int(os.environ['TG_API_ID']), os.environ['TG_API_HASH']) as client:
         await client.get_dialogs()
-        for src in cfg['sources']:
+        for src in sorted(cfg['sources'], key=lambda x: 0 if x['kind'] == 'gornitsa' else 1):  # v40: Горница first (fewer and longer), then the morning words
             ch = str(src['ch'])
             entity = await client.get_entity(int(ch) if re.match(r'^-?\d+$', ch) else ch)
             need, skip = re.compile(src['need'], re.I), re.compile(src['skip'], re.I)
@@ -391,8 +391,11 @@ def main():
         sys.exit('FAITHBOT_URL, FAITHBOT_KEY and GEMINI_KEY are needed (GitHub → Settings → Secrets).')
     global LIMIT_MIN
     cfg = bot('turbo_cfg')
+    if cfg.get('ended'):
+        print('The archive is closed (21 Nov 2026): faithBOT now makes notes only of new recordings. Nothing to do.')
+        return
     if cfg.get('pause'):
-        sys.exit('Light pace: today\'s run is done (faithBOT keeps the backlog to one short run a day after the first 10 days).')
+        sys.exit('Paused by faithBOT.')
     LIMIT_MIN = min(LIMIT_MIN, float(cfg.get('minutes') or LIMIT_MIN))
     if cfg.get('light'):
         log('light pace: %d minutes today' % LIMIT_MIN)
