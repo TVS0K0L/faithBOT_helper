@@ -211,7 +211,7 @@ async def telegram(state):
                 if res:
                     new_seen.append(key)
                     if res is True:
-                        tell('✅ %s «%s» %s → Drive' % (src['folder'], title, date))
+                        tell('✅ %s «%s» %s → Drive' % (src['folder'], title, date), notify=True)  # you see each new recording arrive
         if new_seen:
             bot('seen', posts=new_seen)
         await backlog(client, state)
@@ -226,6 +226,8 @@ async def backlog(client, state):
     from datetime import datetime
     before = datetime.fromisoformat(bl['before'].replace('Z', '+00:00'))
     pos, done = dict(bl.get('pos') or {}), set(bl.get('done') or [])
+    budget = min(BUDGET_MIN, float(bl.get('minutes') or BUDGET_MIN))  # faithBOT keeps old recordings to ~25 min a day (GitHub's free minutes)
+    t0 = time.time()
     for src in state.get('sources') or []:
         ch = str(src['ch'])
         if ch in done:
@@ -239,7 +241,7 @@ async def backlog(client, state):
             kw['offset_date'] = before
         n, finished = 0, True
         async for msg in client.iter_messages(entity, **kw):
-            if (time.time() - STARTED) / 60 > BUDGET_MIN:
+            if (time.time() - t0) / 60 > budget or (time.time() - STARTED) / 60 > 40:
                 finished = False
                 break
             pos[ch] = msg.id
@@ -258,7 +260,8 @@ async def backlog(client, state):
             if os.path.exists(mp3):
                 os.remove(mp3)
             bot('blseen', pos={ch: msg.id}, n=1 if ok else 0)
-        bot('blseen', pos={ch: pos.get(ch, 0)}, done=[ch] if finished else [], n=0)
+        bot('blseen', pos={ch: pos.get(ch, 0)}, done=[ch] if finished else [], n=0, min=round((time.time() - t0) / 60, 1))
+        t0 = time.time()
         if n:
             tell('📚 %s: %d older recordings → faithBOT/Архив%s' % (src['folder'], n, '' if finished else ' (more next run)'))
         if not finished:
