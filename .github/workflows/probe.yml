@@ -1,0 +1,11 @@
+# A one-off check: can this runner download YouTube audio? (safe to delete)
+name: probe
+on: workflow_dispatch
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - run: pip install -q -U yt-dlp
+      - run: |
+          python -m yt_dlp -f bestaudio --no-playlist -o a.%(ext)s "https://www.youtube.com/watch?v=$(python -m yt_dlp --flat-playlist --print id --playlist-end 1 'https://www.youtube.com/playlist?list=PLvFyQq_4JV-DSMoyALR1qTuM54L1PXAeW')" && ls -la a.* || echo "DOWNLOAD FAILED"
