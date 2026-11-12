@@ -290,14 +290,14 @@ def details(text, date):
     return title[:120], d, sp
 
 
-async def telegram(cfg, have):
+async def telegram(cfg, have, kinds=None):
     from telethon import TelegramClient
     from telethon.sessions import StringSession
     before = datetime.fromisoformat(cfg['before'].replace('Z', '+00:00'))
     totals = {}
     async with TelegramClient(StringSession(os.environ['TG_SESSION']), int(os.environ['TG_API_ID']), os.environ['TG_API_HASH']) as client:
         await client.get_dialogs()
-        for src in sorted(cfg['sources'], key=lambda x: 0 if x['kind'] == 'gornitsa' else 1):  # v40: Горница first (fewer and longer), then the morning words
+        for src in sorted([x for x in cfg['sources'] if not kinds or x['kind'] in kinds], key=lambda x: 0 if x['kind'] == 'gornitsa' else 1):  # v40: Горница first
             ch = str(src['ch'])
             entity = await client.get_entity(int(ch) if re.match(r'^-?\d+$', ch) else ch)
             need, skip = re.compile(src['need'], re.I), re.compile(src['skip'], re.I)
@@ -368,7 +368,7 @@ def kafedra(cfg, have):
     for v in cfg.get('yt') or []:
         if left_min() < 15 or YT_SPENT:
             return
-        if v.get('date') and 'kafedra|%s' % v['date'] in have:
+        if v.get('date') and kkey(v['date'], v.get('speaker', '')) in have:
             continue
         log('📝 kafedra', v.get('date'), (v.get('title') or '')[:60])
         try:
@@ -384,6 +384,97 @@ def kafedra(cfg, have):
         except Exception as e:
             log('  ⚠️', str(e)[:160])
             bot('turbo_skip', yt=v['id'])
+
+
+# ---------------------------------------------------------------------- Rutube: the Кафедра as audio (no YouTube limit)
+RUTUBE = '30869662'  # the church's Rutube channel: every Кафедра of Bishop Andrey and Pastor Olga since 2023
+
+
+def kkey(date, speaker):
+    """A Кафедра is known by its date and preacher (both preach on some Sundays)."""
+    return 'kafedra|%s|%s' % (date, 'o' if re.search(r'Ольг|Olga', speaker or '', re.I) else 'a')
+
+
+MONTHS = {'январ': 1, 'феврал': 2, 'март': 3, 'апрел': 4, 'ма': 5, 'июн': 6, 'июл': 7, 'август': 8, 'сентябр': 9, 'октябр': 10, 'ноябр': 11, 'декабр': 12}
+
+
+def title_date(t):
+    """The preached date written in the title: 01.11.2026 · 16.09.18 · 3 февраля 2019 · 23/апреля/2017; else ''."""
+    m = re.search(r'(\d{1,2})\.(\d{1,2})\.(\d{4}|\d{2})\b', t)
+    if m:
+        y = m[3] if len(m[3]) == 4 else '20' + m[3]
+        return '%02d.%02d.%s' % (int(m[1]), int(m[2]), y)
+    m = re.search(r'(\d{1,2})\s*[/ ]\s*([а-яё]+)\s*[/ ]\s*(\d{4})', t.lower())
+    if m:
+        mon = next((n for k, n in sorted(MONTHS.items(), key=lambda x: -len(x[0])) if m[2].startswith(k)), 0)
+        if mon:
+            return '%02d.%02d.%s' % (int(m[1]), mon, m[3])
+    return ''
+
+
+def rutube_list():
+    out, page = [], 1
+    while page < 60:
+        r = requests.get('https://rutube.ru/api/video/person/%s/?page=%d&page_size=20' % (RUTUBE, page), timeout=30, headers={'User-Agent': 'Mozilla/5.0'}).json()
+        for v in r.get('results') or []:
+            t = v.get('title') or ''
+            up = t.upper()
+            if not ('АНДРЕЙ' in up or 'ОЛЬГА' in up) or 'ПОЗДРАВ' in up or (v.get('duration') or 0) < 15 * 60:
+                continue
+            date = title_date(t)
+            title = re.sub(r'^\s*(пастор|епископ)\s+(ольга|андрей)\s+матюжов\w*\s*[-–:]\s*', '', t, flags=re.I)
+            title = re.sub(r'\s*(\||//|-)?\s*(пастор|епископ)\s+(ольга|андрей)\s+#?матюжов\w*.*$', '', title, flags=re.I)
+            title = re.split(r'\s+\d{1,2}\.\d{1,2}\.\d{2,4}|\s+//', title)[0].strip(' |«»"-').strip()
+            title = title[:1].upper() + title[1:].lower() if title.isupper() else title
+            out.append({'id': v['id'], 'title': title or t[:80], 'date': date or datetime.fromisoformat(v['created_ts']).strftime('%d.%m.%Y'), 'dated': bool(date),
+                        'len': v.get('duration') or 0, 'speaker': 'Пастор Ольга Матюжова' if 'ОЛЬГА' in up else 'Епископ Андрей Матюжов'})
+        if not r.get('has_next'):
+            break
+        page += 1
+    return out  # newest first
+
+
+def rutube_kafedra(cfg, have):
+    """v40: every Кафедра from Rutube as small audio (about 8 MB an hour): fast, and no daily YouTube limit."""
+    try:
+        todo = [v for v in rutube_list() if 'rt:' + v['id'] not in have and not (v['dated'] and kkey(v['date'], v['speaker']) in have)]
+    except Exception as e:
+        log('Rutube: list failed:', str(e)[:120])
+        return
+    bot('turbo_totals', totals={'kafedra': len(todo) + sum(1 for h in have if h.startswith('kafedra|'))})
+    log('kafedra (Rutube): %d to do' % len(todo))
+    for v in todo:
+        if left_min() < 25:
+            return
+        log('📝 kafedra', v['date'], v['speaker'].split()[-1], v['title'][:60])
+        src = os.path.join(TMP, 'rt')
+        for f in glob.glob(src + '.*'):
+            os.remove(f)
+        try:
+            r = subprocess.run([sys.executable, '-m', 'yt_dlp', '-q', '--no-warnings', '-f', 'worstaudio/worst', '-o', src + '.%(ext)s',
+                                'https://rutube.ru/video/%s/' % v['id']], capture_output=True, text=True, timeout=1500)
+            got = [f for f in glob.glob(src + '.*') if not f.endswith('.part')]
+            if r.returncode != 0 or not got:
+                log('  · Rutube download failed:', (r.stderr or '').strip()[-120:])
+                continue
+            mp3 = src + '-a.mp3'
+            subprocess.run(['ffmpeg', '-nostdin', '-loglevel', 'error', '-y', '-i', got[0], '-vn', '-ac', '1', '-ar', '16000', '-b:a', '32k', mp3], check=True)
+            os.remove(got[0])
+            tr, total = transcribe_audio(mp3, cfg['transcribe'])
+            os.remove(mp3)
+            if len(tr) < 200:
+                log('  · no speech found')
+                continue
+            res = notes({'kind': 'kafedra', 'title': v['title'], 'date': v['date'], 'speaker': v['speaker'], 'rt': v['id']}, tr, total)
+            log('  ✅' if res.get('ok') else '  · %s' % str(res)[:100])
+            have.add('rt:' + v['id'])
+            if v['dated']:
+                have.add(kkey(v['date'], v['speaker']))
+        except Daily as e:
+            log('⏸', e)
+            raise
+        except Exception as e:
+            log('  ⚠️', str(e)[:160])
 
 
 def main():
@@ -406,8 +497,15 @@ def main():
     rounds = 0
     while left_min() > 10 and rounds < 50:
         rounds += 1
-        kafedra(cfg, have)  # Gemini reads YouTube (up to its daily allowance); the rest of the time goes to Telegram
-        asyncio.run(telegram(cfg, have))
+        try:  # v40 order: Горница, then every Кафедра from Rutube (audio), then the morning words, then any Кафедра only on YouTube
+            asyncio.run(telegram(cfg, have, ['gornitsa']))
+            if cfg.get('end'):  # faithBOT v40 or newer (it knows Rutube ids and the two preachers of one day)
+                rutube_kafedra(cfg, have)
+            asyncio.run(telegram(cfg, have, ['morning']))
+        except Daily as e:
+            log('⏸ Gemini\'s free daily limit: the next run continues', e)
+            break
+        kafedra(cfg, have)
         cfg = bot('turbo_cfg')
         if cfg.get('pause') or not (cfg.get('yt') and not YT_SPENT) or left_min() < 40:
             break
