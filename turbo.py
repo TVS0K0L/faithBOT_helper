@@ -25,7 +25,8 @@ GAPI = 'https://generativelanguage.googleapis.com'
 WRITE_MODELS = ['gemini-flash-latest', 'gemini-flash-lite-latest']
 FAST_MODELS = ['gemini-flash-lite-latest', 'gemini-flash-latest']
 TMP = tempfile.mkdtemp(prefix='turbo-')
-SPENT = set()                   # models whose daily quota is used up in this run
+SPENT = set()                   # models whose daily quota is used up (or that keep timing out) in this run
+SLOW = {}                       # timeouts per model
 YT_SPENT = False                # Gemini's daily YouTube allowance is used up
 
 
@@ -67,9 +68,13 @@ def gemini(models, parts, max_tokens=32768, as_json=False):
             if any('file_data' in p and 'youtube' in p['file_data'].get('file_uri', '') for p in parts):
                 body['generationConfig']['mediaResolution'] = 'MEDIA_RESOLUTION_LOW'
             try:
-                r = requests.post('%s/v1beta/models/%s:generateContent?key=%s' % (GAPI, model, GKEY), json=body, timeout=900)
+                r = requests.post('%s/v1beta/models/%s:generateContent?key=%s' % (GAPI, model, GKEY), json=body, timeout=600)
             except Exception as e:
                 last = str(e)[:120]
+                SLOW[model] = SLOW.get(model, 0) + 1
+                if SLOW[model] >= 2:  # it keeps hanging: the next model for the rest of this run
+                    SPENT.add(model)
+                    break
                 time.sleep(20)
                 continue
             if r.status_code == 200:
@@ -188,7 +193,11 @@ def transcribe_youtube(vid, length, prompt):
             raise
         ended = '[[END]]' in text and len(text.replace('[[END]]', '').strip()) < 40
         if not ended:
-            out.append(shift(text.replace('[[END]]', '').strip(), max(0, pos - 5)))
+            body = text.replace('[[END]]', '').strip()
+            m = re.search(r'\[(\d{1,2}):(\d{2})(?::(\d{2}))?\]', body)
+            first = (int(m[1]) * 3600 + int(m[2]) * 60 + int(m[3])) if m and m[3] else (int(m[1]) * 60 + int(m[2])) if m else 0
+            # Gemini often gives the video's own times for a window: then they are already right
+            out.append(body if pos and first >= pos - 90 else shift(body, max(0, pos - 5)))
         n += 1
         pos = end
         if ended or (total and pos >= total) or pos >= 4 * 3600:
