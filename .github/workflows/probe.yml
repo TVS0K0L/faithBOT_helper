@@ -8,4 +8,7 @@ jobs:
     steps:
       - run: pip install -q -U yt-dlp
       - run: |
-          python -m yt_dlp -f bestaudio --no-playlist -o a.%(ext)s "https://www.youtube.com/watch?v=$(python -m yt_dlp --flat-playlist --print id --playlist-end 1 'https://www.youtube.com/playlist?list=PLvFyQq_4JV-DSMoyALR1qTuM54L1PXAeW')" && ls -la a.* || echo "DOWNLOAD FAILED"
+          ID=$(python -m yt_dlp --flat-playlist --print id --playlist-end 1 "https://www.youtube.com/playlist?list=PLvFyQq_4JV-DSMoyALR1qTuM54L1PXAeW")
+          echo "video $ID"
+          python -m yt_dlp -f bestaudio --no-playlist -o "a.%(ext)s" "https://www.youtube.com/watch?v=$ID" 2>&1 | tail -5 || true
+          ls -la a.* 2>/dev/null || echo "DOWNLOAD FAILED"
