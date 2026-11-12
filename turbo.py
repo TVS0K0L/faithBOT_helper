@@ -279,7 +279,7 @@ async def telegram(cfg, have):
             bot('turbo_totals', totals={src['kind']: len(todo)})
             log('%s: %d in the archive' % (src['kind'], len(todo)))
             for msg in todo:  # newest first
-                if left_min() < 25:
+                if left_min() < 10:
                     return
                 title, date, sp = details(msg.message or '', msg.date)
                 if '%s|%s' % (src['kind'], date) in have:
@@ -331,7 +331,7 @@ async def fetch_post(client, msg):
 # ---------------------------------------------------------------------- YouTube: the Кафедра archive
 def kafedra(cfg, have):
     for v in cfg.get('yt') or []:
-        if left_min() < 40 or YT_SPENT:
+        if left_min() < 15 or YT_SPENT:
             return
         if v.get('date') and 'kafedra|%s' % v['date'] in have:
             continue
@@ -354,17 +354,23 @@ def kafedra(cfg, have):
 def main():
     if not (URL and KEY and GKEY):
         sys.exit('FAITHBOT_URL, FAITHBOT_KEY and GEMINI_KEY are needed (GitHub → Settings → Secrets).')
+    global LIMIT_MIN
     cfg = bot('turbo_cfg')
+    if cfg.get('pause'):
+        sys.exit('Light pace: today\'s run is done (faithBOT keeps the backlog to one short run a day after the first 10 days).')
+    LIMIT_MIN = min(LIMIT_MIN, float(cfg.get('minutes') or LIMIT_MIN))
+    if cfg.get('light'):
+        log('light pace: %d minutes today' % LIMIT_MIN)
     if not cfg.get('transcribe'):
         sys.exit('faithBOT did not answer (is v36 installed?): %s' % str(cfg)[:200])
     have = set(cfg.get('have') or [])
     rounds = 0
-    while left_min() > 40 and rounds < 50:
+    while left_min() > 10 and rounds < 50:
         rounds += 1
         kafedra(cfg, have)  # Gemini reads YouTube (up to its daily allowance); the rest of the time goes to Telegram
         asyncio.run(telegram(cfg, have))
         cfg = bot('turbo_cfg')
-        if not (cfg.get('yt') and not YT_SPENT) or left_min() < 40:
+        if cfg.get('pause') or not (cfg.get('yt') and not YT_SPENT) or left_min() < 40:
             break
     shutil.rmtree(TMP, ignore_errors=True)
 
