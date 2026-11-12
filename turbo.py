@@ -487,6 +487,25 @@ def rutube_kafedra(cfg, have):
             log('  ⚠️', str(e)[:160])
 
 
+# ---------------------------------------------------------------------- v43: a picture and a link for every Кафедра
+def rt_links(cfg):
+    """Кафедра notes with no video: found on Rutube by date and preacher (a picture and a link in the app)."""
+    items = cfg.get('nort') or []
+    if not items:
+        return
+    try:
+        by = {kkey(v['date'], v['speaker']): v['id'] for v in rutube_list() if v['dated']}
+    except Exception as e:
+        log('Rutube links: list failed:', str(e)[:100])
+        return
+    n = 0
+    for it in items:
+        rt = by.get(kkey(it['date'], it.get('speaker', '')), '')
+        bot('turbo_rtlink', id=it['id'], rt=rt)
+        n += 1 if rt else 0
+    log('Rutube links: %d of %d Кафедра linked' % (n, len(items)))
+
+
 # ---------------------------------------------------------------------- v41: every church message gets its transcript
 async def transcripts(cfg):
     """Notes without a transcript (often older ones): the recording is found (Rutube, the church's Telegram, YouTube),
@@ -601,6 +620,7 @@ def study(cfg):
 def quiet(cfg):
     """v41: missing transcripts, older notes in the new format, and at night the study. After 21 Nov this is all that runs."""
     try:
+        rt_links(cfg)  # v43
         redo(cfg)
         asyncio.run(transcripts(cfg))
         rounds = 0
@@ -634,6 +654,7 @@ def main():
     if not cfg.get('transcribe'):
         sys.exit('faithBOT did not answer (is v39 installed?): %s' % str(cfg)[:200])
     have = set(cfg.get('have') or [])
+    rt_links(cfg)  # v43: pictures and links for the Кафедра (a few seconds)
     redo(cfg)  # v39: the notes you already have, in the new format (no transcription needed: quick)
     rounds = 0
     while left_min() > 10 and rounds < 50:
