@@ -222,8 +222,43 @@ def notes(meta, transcript, total):
         a = json.loads(re.sub(r'^```(?:json)?\s*|\s*```$', '', aj.strip()))
     except Exception as e:
         log('  · analysis skipped:', str(e)[:80])
-    res = bot('turbo_done', md=md, analysis=a, model=model, **meta)
+    ru = member_edition(pr, md)
+    res = bot('turbo_done', md=md, analysis=a, model=model, ru=ru, **meta)
     return res
+
+
+def member_edition(pr, md):
+    """v39: the members' notes in Russian (no Форум, no Diana, written to the reader); empty if it fails."""
+    if not pr.get('member'):
+        return ''
+    try:
+        ru, _ = gemini(WRITE_MODELS, [{'text': pr['member'].replace('{NOTES}', md)}], max_tokens=65536)
+        ru = re.sub(r'\n```\s*$', '', re.sub(r'^```(?:markdown|md)?\s*\n', '', ru.strip())).strip()
+        return ru if len(ru) > 300 else ''
+    except Exception as e:
+        log('  · members\' edition skipped:', str(e)[:80])
+        return ''
+
+
+def redo(cfg):
+    """v39: older church notes rewritten in the new format from their transcripts (the same Google Doc, its link stays)."""
+    for it in (cfg.get('redo') or []):
+        if left_min() < 25:
+            return
+        try:
+            tr = (bot('turbo_tr', id=it['id']) or {}).get('transcript') or ''
+            if len(tr) < 200:
+                continue
+            log('rewrite: %s %s «%s»' % (it['kind'], it['date'], it['title'][:50]))
+            pr = bot('turbo_prompt', kind=it['kind'], title=it['title'], date=it['date'], speaker=it.get('speaker', ''), transcript=tr, duration=0)
+            md, model = gemini(WRITE_MODELS, [{'text': pr['write']}], max_tokens=65536)
+            md = re.sub(r'\n```\s*$', '', re.sub(r'^```(?:markdown|md)?\s*\n', '', md.strip())).strip()
+            if len(md) < 300:
+                continue
+            r = bot('turbo_redo', id=it['id'], md=md, ru=member_edition(pr, md), model=model)
+            log('  ✓ rewritten' if r.get('ok') else '  · not saved: %s' % str(r)[:100])
+        except Exception as e:
+            log('  · rewrite skipped:', str(e)[:100])
 
 
 # ---------------------------------------------------------------------- Telegram: morning words and Горница
@@ -362,8 +397,9 @@ def main():
     if cfg.get('light'):
         log('light pace: %d minutes today' % LIMIT_MIN)
     if not cfg.get('transcribe'):
-        sys.exit('faithBOT did not answer (is v36 installed?): %s' % str(cfg)[:200])
+        sys.exit('faithBOT did not answer (is v39 installed?): %s' % str(cfg)[:200])
     have = set(cfg.get('have') or [])
+    redo(cfg)  # v39: the notes you already have, in the new format (no transcription needed: quick)
     rounds = 0
     while left_min() > 10 and rounds < 50:
         rounds += 1
