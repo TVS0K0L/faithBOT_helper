@@ -9,10 +9,12 @@ them quietly (Google Doc, members' PDF, library card, long-term memory). Nothing
 
 Runs for up to ~5.5 hours, then the next run continues. Uses its own Gemini key (GEMINI_KEY), so faithBOT's
 own daily quota stays for new sermons and the Pastor.
+v41: also finds the recording of any church note without a transcript and transcribes it (timestamps), and at
+night (Dubai 22:00–07:00) studies every message once for the Pastor. After 21 Nov 2026 only these quiet jobs run.
 Secrets: TG_API_ID, TG_API_HASH, TG_SESSION, FAITHBOT_URL, FAITHBOT_KEY, GEMINI_KEY
 """
 import asyncio, glob, json, os, re, shutil, subprocess, sys, tempfile, time
-from datetime import datetime
+from datetime import datetime, timezone
 import requests
 
 URL = os.environ.get('FAITHBOT_URL', '').strip()
@@ -434,6 +436,23 @@ def rutube_list():
     return out  # newest first
 
 
+def rutube_audio(vid):
+    """A Rutube video as a small MP3 (mono, 32 kbit/s: about 8 MB an hour), or None."""
+    src = os.path.join(TMP, 'rt')
+    for f in glob.glob(src + '*'):
+        os.remove(f)
+    r = subprocess.run([sys.executable, '-m', 'yt_dlp', '-q', '--no-warnings', '-f', 'worstaudio/worst', '-o', src + '.%(ext)s',
+                        'https://rutube.ru/video/%s/' % vid], capture_output=True, text=True, timeout=1500)
+    got = [f for f in glob.glob(src + '.*') if not f.endswith('.part')]
+    if r.returncode != 0 or not got:
+        log('  · Rutube download failed:', (r.stderr or '').strip()[-120:])
+        return None
+    mp3 = src + '-a.mp3'
+    subprocess.run(['ffmpeg', '-nostdin', '-loglevel', 'error', '-y', '-i', got[0], '-vn', '-ac', '1', '-ar', '16000', '-b:a', '32k', mp3], check=True)
+    os.remove(got[0])
+    return mp3
+
+
 def rutube_kafedra(cfg, have):
     """v40: every Кафедра from Rutube as small audio (about 8 MB an hour): fast, and no daily YouTube limit."""
     try:
@@ -447,19 +466,10 @@ def rutube_kafedra(cfg, have):
         if left_min() < 25:
             return
         log('📝 kafedra', v['date'], v['speaker'].split()[-1], v['title'][:60])
-        src = os.path.join(TMP, 'rt')
-        for f in glob.glob(src + '.*'):
-            os.remove(f)
         try:
-            r = subprocess.run([sys.executable, '-m', 'yt_dlp', '-q', '--no-warnings', '-f', 'worstaudio/worst', '-o', src + '.%(ext)s',
-                                'https://rutube.ru/video/%s/' % v['id']], capture_output=True, text=True, timeout=1500)
-            got = [f for f in glob.glob(src + '.*') if not f.endswith('.part')]
-            if r.returncode != 0 or not got:
-                log('  · Rutube download failed:', (r.stderr or '').strip()[-120:])
+            mp3 = rutube_audio(v['id'])
+            if not mp3:
                 continue
-            mp3 = src + '-a.mp3'
-            subprocess.run(['ffmpeg', '-nostdin', '-loglevel', 'error', '-y', '-i', got[0], '-vn', '-ac', '1', '-ar', '16000', '-b:a', '32k', mp3], check=True)
-            os.remove(got[0])
             tr, total = transcribe_audio(mp3, cfg['transcribe'])
             os.remove(mp3)
             if len(tr) < 200:
@@ -477,11 +487,142 @@ def rutube_kafedra(cfg, have):
             log('  ⚠️', str(e)[:160])
 
 
+# ---------------------------------------------------------------------- v41: every church message gets its transcript
+async def transcripts(cfg):
+    """Notes without a transcript (often older ones): the recording is found (Rutube, the church's Telegram, YouTube),
+    transcribed word for word with timestamps, and faithBOT saves it as a Google Doc next to the notes."""
+    items = cfg.get('notr') or []
+    if not items:
+        return
+    log('transcripts: %d messages have none yet' % len(items))
+    rt, posts, client = None, None, None
+    try:
+        for it in items:
+            if left_min() < 20:
+                return
+            path, total, tr = None, 0, ''
+            try:
+                if it['kind'] == 'kafedra':
+                    vid = it.get('rt')
+                    if not vid:
+                        if rt is None:
+                            rt = rutube_list()
+                        m = next((v for v in rt if v['dated'] and kkey(v['date'], v['speaker']) == kkey(it['date'], it.get('speaker', ''))), None)
+                        vid = m['id'] if m else None
+                    if vid:
+                        path = rutube_audio(vid)
+                elif it['kind'] in ('gornitsa', 'morning'):
+                    if posts is None:
+                        client, posts = await post_index(cfg)
+                    msg = posts.get('%s|%s' % (it['kind'], it['date']))
+                    if msg:
+                        path = await fetch_post(client, msg)
+                if path:
+                    log('🗒', it['kind'], it['date'], it['title'][:60])
+                    tr, total = transcribe_audio(path, cfg['transcribe'])
+                    os.remove(path)
+                elif it.get('yt') and not YT_SPENT:
+                    log('🗒 (YouTube)', it['kind'], it['date'], it['title'][:60])
+                    tr, total = transcribe_youtube(it['yt'], 0, cfg['transcribe'])
+                if len(tr) >= 200:
+                    r = bot('turbo_trsave', id=it['id'], transcript=tr, duration=int(total))
+                    log('  ✓ transcript saved' if r.get('ok') else '  · %s' % str(r)[:100])
+                else:
+                    bot('turbo_trmiss', id=it['id'])
+                    log('  · recording not found:', it['kind'], it['date'])
+            except Daily:
+                if YT_SPENT and not all(m in SPENT for m in WRITE_MODELS):
+                    continue  # only YouTube's daily allowance: the next one may be on Rutube or Telegram
+                raise
+            except Exception as e:
+                log('  ⚠️', str(e)[:160])
+                bot('turbo_trmiss', id=it['id'])
+    finally:
+        if client:
+            await client.disconnect()
+
+
+async def post_index(cfg):
+    """Every Горница and morning word post of the church's Telegram, by kind and date (the newest post of a day wins)."""
+    from telethon import TelegramClient
+    from telethon.sessions import StringSession
+    client = TelegramClient(StringSession(os.environ['TG_SESSION']), int(os.environ['TG_API_ID']), os.environ['TG_API_HASH'])
+    await client.connect()
+    await client.get_dialogs()
+    out = {}
+    for src in [x for x in cfg.get('sources') or [] if x['kind'] in ('gornitsa', 'morning')]:
+        ch = str(src['ch'])
+        entity = await client.get_entity(int(ch) if re.match(r'^-?\d+$', ch) else ch)
+        need, skip = re.compile(src['need'], re.I), re.compile(src['skip'], re.I)
+        async for msg in client.iter_messages(entity, reply_to=src.get('topic') or None):
+            text = msg.message or ''
+            if not (msg.video or post_link(msg)) or not need.search(text) or skip.search(text):
+                continue
+            _, date, _ = details(text, msg.date)
+            out.setdefault('%s|%s' % (src['kind'], date), msg)
+    return client, out
+
+
+# ---------------------------------------------------------------------- v41: the mentor's night study
+def night(cfg):
+    """Dubai night (22:00–07:00): nobody is waiting for the bot."""
+    a, b = cfg.get('night') or [22, 7]
+    h = (datetime.now(timezone.utc).hour + int(cfg.get("tz", 4))) % 24
+    return h >= a or h < b
+
+
+def study(cfg):
+    """Each Кафедра, Горница, morning word and YouTube ministry read in full once, written up for the Pastor (quietly)."""
+    n = 0
+    for it in cfg.get('study') or []:
+        if left_min() < 10 or not night(cfg):
+            break
+        src = bot('turbo_src', id=it['id'])
+        if src.get('gone'):
+            continue
+        if src.get('empty') or not src.get('prompt'):
+            bot('turbo_stskip', id=it['id'])
+            continue
+        try:
+            text, _ = gemini(WRITE_MODELS, [{'text': src['prompt']}], max_tokens=12288)
+            text = re.sub(r'\n```\s*$', '', re.sub(r'^```(?:markdown|md)?\s*\n', '', text.strip())).strip()
+            r = bot('turbo_study', id=it['id'], text=text)
+            if r.get('ok'):
+                n += 1
+                log('🌙 studied:', it['kind'], it['date'], it['title'][:50])
+        except Daily:
+            raise
+        except Exception as e:
+            log('  · study skipped:', str(e)[:100])
+            bot('turbo_stskip', id=it['id'])
+    return n
+
+
+def quiet(cfg):
+    """v41: missing transcripts, older notes in the new format, and at night the study. After 21 Nov this is all that runs."""
+    try:
+        redo(cfg)
+        asyncio.run(transcripts(cfg))
+        rounds = 0
+        while night(cfg) and left_min() > 10 and rounds < 30:
+            rounds += 1
+            if not study(cfg):
+                break
+            cfg = bot('turbo_cfg')
+    except Daily as e:
+        log('⏸ Gemini\'s free daily limit: the next run continues', e)
+
+
 def main():
     if not (URL and KEY and GKEY):
         sys.exit('FAITHBOT_URL, FAITHBOT_KEY and GEMINI_KEY are needed (GitHub → Settings → Secrets).')
     global LIMIT_MIN
     cfg = bot('turbo_cfg')
+    if cfg.get('after'):  # v41: the archive is closed (21 Nov 2026); transcripts, rewrites and the night study go on
+        log('The archive is closed: missing transcripts, rewrites and the night study only.')
+        quiet(cfg)
+        shutil.rmtree(TMP, ignore_errors=True)
+        return
     if cfg.get('ended'):
         print('The archive is closed (21 Nov 2026): faithBOT now makes notes only of new recordings. Nothing to do.')
         return
@@ -509,6 +650,8 @@ def main():
         cfg = bot('turbo_cfg')
         if cfg.get('pause') or not (cfg.get('yt') and not YT_SPENT) or left_min() < 40:
             break
+    if left_min() > 20 and not cfg.get('pause') and not all(m in SPENT for m in WRITE_MODELS):
+        quiet(cfg)  # v41: time left in this run: missing transcripts, then the night study
     shutil.rmtree(TMP, ignore_errors=True)
 
 

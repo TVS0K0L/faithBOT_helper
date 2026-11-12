@@ -1,4 +1,5 @@
-# faithBOT · the backlog on GitHub: full notes of every old Кафедра, Горница and morning word.
+# faithBOT · the backlog on GitHub: full notes of every old Кафедра, Горница and morning word (until 21 Nov 2026);
+# v41: then, quietly, the missing transcripts and the night study for the Pastor (Dubai 22:00–07:00).
 # Each run works up to ~5.5 hours; a new one starts every 6 hours (and faithBOT starts one if GitHub skips it).
 name: faithBOT backlog
 on:
