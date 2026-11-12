@@ -547,13 +547,36 @@ def rt_links(cfg):
     if not items:
         return
     try:
-        by = {kkey(v['date'], v['speaker']): v['id'] for v in rutube_list() if v['dated']}
+        vids = rutube_list()
     except Exception as e:
         log('Rutube links: list failed:', str(e)[:100])
         return
+    by = {kkey(v['date'], v['speaker']): v['id'] for v in vids if v['dated']}
+    day = {}
+    for v in vids:
+        day.setdefault(v['date'], []).append(v)
+
+    def near(d, k):  # the same preacher one day before or after (an upload a day late)
+        try:
+            t = datetime.strptime(d, '%d.%m.%Y')
+        except ValueError:
+            return ''
+        for off in (1, -1):
+            dd = (t + __import__('datetime').timedelta(days=off)).strftime('%d.%m.%Y')
+            for v in day.get(dd, []):
+                if kkey(dd, v['speaker']).endswith(k):
+                    return v['id']
+        return ''
     n = 0
     for it in items:
-        rt = by.get(kkey(it['date'], it.get('speaker', '')), '')
+        sp = it.get('speaker', '') or ''
+        known = bool(re.search(r'Андре|Andre|Ольг|Olga', sp, re.I))
+        k = kkey(it['date'], sp)
+        rt = by.get(k, '') if known else ''
+        if not rt and not known and len(day.get(it['date'], [])) == 1:  # preacher unknown: the only video of that day
+            rt = day[it['date']][0]['id']
+        if not rt and known:
+            rt = near(it['date'], k[-2:])
         bot('turbo_rtlink', id=it['id'], rt=rt)
         n += 1 if rt else 0
     log('Rutube links: %d of %d Кафедра linked' % (n, len(items)))
