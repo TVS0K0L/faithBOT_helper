@@ -24,7 +24,7 @@ STARTED = time.time()
 LIMIT_MIN = float(os.environ.get('TURBO_MINUTES', '330'))
 CHUNK = 15 * 60                 # transcription parts of 15 minutes
 GAPI = 'https://generativelanguage.googleapis.com'
-WRITE_MODELS = ['gemini-flash-latest', 'gemini-flash-lite-latest']
+WRITE_MODELS = ['gemini-flash-latest', 'gemini-flash-lite-latest', 'gemini-2.5-flash']  # the last only when the others are overloaded
 FAST_MODELS = ['gemini-flash-lite-latest', 'gemini-flash-latest']
 TMP = tempfile.mkdtemp(prefix='turbo-')
 SPENT = set()                   # models whose daily quota is used up (or that keep timing out) in this run
@@ -97,8 +97,8 @@ def gemini(models, parts, max_tokens=32768, as_json=False):
                     break
                 time.sleep(45)
                 continue
-            if r.status_code in (500, 502, 503, 504):
-                time.sleep(30)
+            if r.status_code in (500, 502, 503, 504):  # overloaded: wait longer each time (30 s … 4 min) instead of giving up
+                time.sleep(min(240, 30 * 2 ** attempt))
                 continue
             if r.status_code == 404:
                 SPENT.add(model)
@@ -207,8 +207,61 @@ def transcribe_youtube(vid, length, prompt):
     return '\n\n'.join(out), total or pos
 
 
-def notes(meta, transcript, total):
-    """The full notes with faithBOT's own prompt, then its analysis, then saved by faithBOT (quietly)."""
+HAVE = set()  # what this run already has (the same set the loops use)
+PEND = 'pending'  # transcripts whose notes could not be written yet (kept between runs by the workflow's cache)
+
+
+def pend_key(meta):
+    return re.sub(r'[^\w.-]+', '_', '%s_%s_%s' % (meta.get('kind', ''), meta.get('date', ''), meta.get('rt') or meta.get('yt') or (meta.get('speaker') or '')[:12]))
+
+
+def save_pending(meta, transcript, total):
+    os.makedirs(PEND, exist_ok=True)
+    with open(os.path.join(PEND, pend_key(meta) + '.json'), 'w', encoding='utf-8') as f:
+        json.dump({'meta': meta, 'transcript': transcript, 'total': total}, f, ensure_ascii=False)
+    log('  💾 transcript kept: the notes will be written next time (no second transcription)')
+    HAVE.add('%s|%s' % (meta.get('kind'), meta.get('date')))
+    if meta.get('rt'):
+        HAVE.add('rt:' + meta['rt'])
+
+
+def run_pending(have):
+    """v44: first the transcripts already made: only the notes are written (minutes, not hours)."""
+    files = sorted(glob.glob(os.path.join(PEND, '*.json')))
+    if files:
+        log('pending: %d transcripts waiting for their notes' % len(files))
+    for path in files:
+        if left_min() < 15:
+            return
+        try:
+            d = json.load(open(path, encoding='utf-8'))
+            m = d['meta']
+            log('📝 (kept) %s %s %s' % (m.get('kind'), m.get('date'), (m.get('title') or '')[:50]))
+            res = notes(m, d['transcript'], d['total'], keep=False)
+            if res.get('ok') or res.get('have'):
+                os.remove(path)
+                log('  ✅')
+                have.add('%s|%s' % (m.get('kind'), m.get('date')))
+                if m.get('rt'):
+                    have.add('rt:' + m['rt'])
+        except Daily:
+            raise
+        except Exception as e:
+            log('  ⚠️ still waiting:', str(e)[:120])
+
+
+def notes(meta, transcript, total, keep=True):
+    """The full notes with faithBOT's own prompt, then its analysis, then saved by faithBOT (quietly).
+    v44: if the AI is overloaded, the transcript is kept and the notes are written on the next run."""
+    try:
+        return notes_(meta, transcript, total)
+    except Exception:
+        if keep:
+            save_pending(meta, transcript, total)
+        raise
+
+
+def notes_(meta, transcript, total):
     meta = dict(meta, transcript=transcript, duration=int(total))
     pr = bot('turbo_prompt', **meta)
     if not pr.get('write'):
@@ -637,6 +690,7 @@ def main():
     if not (URL and KEY and GKEY):
         sys.exit('FAITHBOT_URL, FAITHBOT_KEY and GEMINI_KEY are needed (GitHub → Settings → Secrets).')
     global LIMIT_MIN
+    os.makedirs(PEND, exist_ok=True)
     cfg = bot('turbo_cfg')
     if cfg.get('after'):  # v41: the archive is closed (21 Nov 2026); transcripts, rewrites and the night study go on
         log('The archive is closed: missing transcripts, rewrites and the night study only.')
@@ -653,8 +707,21 @@ def main():
         log('light pace: %d minutes today' % LIMIT_MIN)
     if not cfg.get('transcribe'):
         sys.exit('faithBOT did not answer (is v39 installed?): %s' % str(cfg)[:200])
-    have = set(cfg.get('have') or [])
+    have = HAVE
+    have.update(cfg.get('have') or [])
     rt_links(cfg)  # v43: pictures and links for the Кафедра (a few seconds)
+    try:
+        run_pending(have)  # v44: transcripts already made, first
+    except Daily as e:
+        log('⏸', e)
+    for path in glob.glob(os.path.join(PEND, '*.json')):  # still waiting: never transcribed again in this run
+        try:
+            m = json.load(open(path, encoding='utf-8'))['meta']
+            have.add('%s|%s' % (m.get('kind'), m.get('date')))
+            if m.get('rt'):
+                have.add('rt:' + m['rt'])
+        except Exception:
+            pass
     redo(cfg)  # v39: the notes you already have, in the new format (no transcription needed: quick)
     rounds = 0
     while left_min() > 10 and rounds < 50:
