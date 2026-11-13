@@ -25,10 +25,10 @@ STARTED = time.time()
 LIMIT_MIN = float(os.environ.get('TURBO_MINUTES', '330'))
 CHUNK = 30 * 60                 # v46: transcription parts of 30 minutes (half the requests)
 GAPI = 'https://generativelanguage.googleapis.com'
-WRITE_MODELS = ['gemini-flash-latest', 'gemini-3.7-flash', 'gemini-3.6-flash', 'gemini-3.5-flash']  # v48: each full Flash model has its own daily allowance (2.5 is retired)
+WRITE_MODELS = ['gemini-3.7-flash', 'gemini-3.6-flash', 'gemini-3.5-flash']  # v48: full Flash, each with its own daily allowance; never the models NewsBOT and SportsBOT use (flash-latest, 3.8), so their morning digests always have quota
 #  # v47: the notes and the Russian edition only on Flash (complete, never the lighter model)
-FAST_MODELS = ['gemini-flash-lite-latest', 'gemini-flash-latest']
-TR_MODELS = ['gemini-flash-lite-latest', 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-flash-latest']  # v48
+FAST_MODELS = ['gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-3.6-flash']  # v48: not the digests' models
+TR_MODELS = ['gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-3.5-flash']  # v48: not flash-lite-latest / flash-latest (the digests' models)
 #  # v46: transcription on Flash-Lite (its own, larger daily allowance); Flash kept for the notes
 TMP = tempfile.mkdtemp(prefix='turbo-')
 SPENT = set()                   # models whose daily quota is used up (or that keep timing out) in this run
