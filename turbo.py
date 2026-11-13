@@ -25,7 +25,7 @@ STARTED = time.time()
 LIMIT_MIN = float(os.environ.get('TURBO_MINUTES', '330'))
 CHUNK = 30 * 60                 # v46: transcription parts of 30 minutes (half the requests)
 GAPI = 'https://generativelanguage.googleapis.com'
-WRITE_MODELS = ['gemini-flash-latest', 'gemini-flash-lite-latest', 'gemini-2.5-flash']  # the last only when the others are overloaded
+WRITE_MODELS = ['gemini-flash-latest', 'gemini-2.5-flash']  # v47: the notes and the Russian edition only on Flash (complete, never the lighter model)
 FAST_MODELS = ['gemini-flash-lite-latest', 'gemini-flash-latest']
 TR_MODELS = ['gemini-flash-lite-latest', 'gemini-flash-latest']  # v46: transcription on Flash-Lite (its own, larger daily allowance); Flash kept for the notes
 TMP = tempfile.mkdtemp(prefix='turbo-')
@@ -328,7 +328,7 @@ def member_edition(pr, md):
     if not pr.get('member'):
         return ''
     try:
-        ru, _ = gemini(FAST_MODELS, [{'text': pr['member'].replace('{NOTES}', md)}], max_tokens=65536)  # v46: the Russian edition on Flash-Lite
+        ru, _ = gemini(WRITE_MODELS, [{'text': pr['member'].replace('{NOTES}', md)}], max_tokens=65536)  # the Russian edition, complete, on Flash (as the notes)
         ru = re.sub(r'\n```\s*$', '', re.sub(r'^```(?:markdown|md)?\s*\n', '', ru.strip())).strip()
         return ru if len(ru) > 300 else ''
     except Exception as e:
@@ -717,6 +717,8 @@ def night(cfg):
 
 
 def study(cfg):
+    if cfg.get('key2busy'):  # v45: the live bot is on the second key: leave its quota to the members
+        log('study: the bot is using the second key, waiting'); return
     """Each Кафедра, Горница, morning word and YouTube ministry read in full once, written up for the Pastor (quietly)."""
     n = 0
     for it in cfg.get('study') or []:
