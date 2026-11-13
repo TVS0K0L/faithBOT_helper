@@ -19,7 +19,8 @@ import requests
 
 URL = os.environ.get('FAITHBOT_URL', '').strip()
 KEY = os.environ.get('FAITHBOT_KEY', '').strip()
-GKEY = os.environ.get('GEMINI_KEY', '').strip()
+KEYS = [k for k in [os.environ.get(n, '').strip() for n in ('GEMINI_KEY', 'GEMINI_KEY2', 'GEMINI_KEY3', 'GEMINI_KEY4')] if k]
+GKEY = KEYS[0] if KEYS else ''
 STARTED = time.time()
 LIMIT_MIN = float(os.environ.get('TURBO_MINUTES', '330'))
 CHUNK = 15 * 60                 # transcription parts of 15 minutes
@@ -104,8 +105,23 @@ def gemini(models, parts, max_tokens=32768, as_json=False):
                 SPENT.add(model)
             break
     if all(m in SPENT for m in models):
+        if next_key():  # v45: another Google account's free quota
+            return gemini(models, parts, max_tokens, as_json)
         raise Daily('Gemini daily quota used up (%s)' % last)
     raise RuntimeError('Gemini: ' + last)
+
+
+def next_key():
+    """The next Gemini key (another account's daily quota); False when there is none left."""
+    global GKEY
+    i = KEYS.index(GKEY) if GKEY in KEYS else -1
+    if i + 1 >= len(KEYS):
+        return False
+    GKEY = KEYS[i + 1]
+    SPENT.clear()
+    SLOW.clear()
+    log('🔑 Gemini key %d of %d (the previous one used its free daily quota)' % (i + 2, len(KEYS)))
+    return True
 
 
 def upload(path, mime):
@@ -208,6 +224,28 @@ def transcribe_youtube(vid, length, prompt):
 
 
 HAVE = set()  # what this run already has (the same set the loops use)
+MEMO = os.path.join('pending', 'memo.json')  # v45: kept between runs: what was finished, rewrites that keep failing
+
+
+def memo():
+    try:
+        return json.load(open(MEMO, encoding='utf-8'))
+    except Exception:
+        return {'done': [], 'redofail': {}}
+
+
+def memo_save(m):
+    os.makedirs('pending', exist_ok=True)
+    json.dump(m, open(MEMO, 'w', encoding='utf-8'), ensure_ascii=False)
+
+
+def mark_done(meta):
+    m = memo()
+    for k in ['%s|%s' % (meta.get('kind'), meta.get('date'))] + (['rt:' + meta['rt']] if meta.get('rt') else []):
+        if k not in m['done']:
+            m['done'].append(k)
+        HAVE.add(k)
+    memo_save(m)
 PEND = 'pending'  # transcripts whose notes could not be written yet (kept between runs by the workflow's cache)
 
 
@@ -279,6 +317,8 @@ def notes_(meta, transcript, total):
         log('  · analysis skipped:', str(e)[:80])
     ru = member_edition(pr, md)
     res = bot('turbo_done', md=md, analysis=a, model=model, ru=ru, **meta)
+    if res.get('ok') or res.get('have'):
+        mark_done(meta)  # v45: never made twice, even if faithBOT lists it under another date
     return res
 
 
@@ -297,9 +337,12 @@ def member_edition(pr, md):
 
 def redo(cfg):
     """v39: older church notes rewritten in the new format from their transcripts (the same Google Doc, its link stays)."""
+    fails = memo().get('redofail', {})
     for it in (cfg.get('redo') or []):
         if left_min() < 25:
             return
+        if fails.get(it['id'], 0) >= 2:  # v45: it failed twice on faithBOT's side: not again
+            continue
         try:
             tr = (bot('turbo_tr', id=it['id']) or {}).get('transcript') or ''
             if len(tr) < 200:
@@ -312,6 +355,12 @@ def redo(cfg):
                 continue
             r = bot('turbo_redo', id=it['id'], md=md, ru=member_edition(pr, md), model=model)
             log('  ✓ rewritten' if r.get('ok') else '  · not saved: %s' % str(r)[:100])
+            if not r.get('ok'):
+                m = memo()
+                m.setdefault('redofail', {})[it['id']] = m.get('redofail', {}).get(it['id'], 0) + 1
+                memo_save(m)
+        except Daily:
+            return
         except Exception as e:
             log('  · rewrite skipped:', str(e)[:100])
 
@@ -732,6 +781,7 @@ def main():
         sys.exit('faithBOT did not answer (is v39 installed?): %s' % str(cfg)[:200])
     have = HAVE
     have.update(cfg.get('have') or [])
+    have.update(memo().get('done', []))  # v45
     rt_links(cfg)  # v43: pictures and links for the Кафедра (a few seconds)
     try:
         run_pending(have)  # v44: transcripts already made, first

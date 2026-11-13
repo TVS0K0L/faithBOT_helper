@@ -32,6 +32,9 @@ jobs:
           FAITHBOT_URL: ${{ secrets.FAITHBOT_URL }}
           FAITHBOT_KEY: ${{ secrets.FAITHBOT_KEY }}
           GEMINI_KEY: ${{ secrets.GEMINI_KEY }}
+          GEMINI_KEY2: ${{ secrets.GEMINI_KEY2 }}
+          GEMINI_KEY3: ${{ secrets.GEMINI_KEY3 }}
+          GEMINI_KEY4: ${{ secrets.GEMINI_KEY4 }}
       - uses: actions/cache/save@v4
         if: always()
         with:
