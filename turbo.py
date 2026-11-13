@@ -718,6 +718,50 @@ def night(cfg):
     return h >= a or h < b
 
 
+def wiki_film(title, year, kind):
+    """v49: the English Wikipedia summary of a film or series (the best match among the usual page names)."""
+    names = ['%s (%s %s)' % (title, year, 'TV series' if kind == 'series' else 'film')] if year else []
+    names += ['%s (%s)' % (title, 'TV series' if kind == 'series' else 'film'), title]
+    for n in names:
+        try:
+            r = requests.get('https://en.wikipedia.org/api/rest_v1/page/summary/' + requests.utils.quote(n.replace(' ', '_')), timeout=20,
+                             headers={'User-Agent': 'faithBOT-helper/1.0 (church film library)'})
+            if r.status_code == 200:
+                j = r.json()
+                ex = j.get('extract') or ''
+                if j.get('type') != 'disambiguation' and re.search(r'\b(film|movie|series|documentary|animated|television)\b', ex, re.I):
+                    return j.get('title') or n, ex
+        except Exception:
+            pass
+        time.sleep(1)
+    return '', ''
+
+
+def films(cfg):
+    """v49: describes the films waiting in the library (Wikipedia + a light model), so faithBOT spends no minutes on them."""
+    todo, base = cfg.get('films') or [], cfg.get('filmprompt') or ''
+    if not todo or not base:
+        return
+    n, t0 = 0, time.time()
+    for f in todo[:25]:
+        if time.time() - t0 > 600 or left_min() < 30:
+            break
+        title, intro = wiki_film(f['en'], f.get('year'), f.get('kind'))
+        prompt = (base.replace('{KIND}', 'series' if f.get('kind') == 'series' else 'film').replace('{TITLE}', f['en'])
+                  .replace('{YEAR}', str(f.get('year') or '?')).replace('{EN}', intro or '(not found)').replace('{REC}', '(none)').replace('{RU}', '(not found)'))
+        try:
+            text, _ = gemini(FAST_MODELS, [{'text': prompt}], max_tokens=6144, as_json=True)
+            r = json.loads(text[text.find('{'):text.rfind('}') + 1])
+        except Daily:
+            break
+        except Exception as e:
+            log('  · film %s: %s' % (f['en'], str(e)[:80]))
+            continue
+        out = bot('turbo_film', id=f['id'], r=r, wiki=title)
+        n += 1 if out.get('ok') else 0
+    log('🎬 films described: %d of %d waiting' % (n, len(todo)))
+
+
 def study(cfg):
     if cfg.get('key2busy'):  # v45: the live bot is on the second key: leave its quota to the members
         log('study: the bot is using the second key, waiting'); return
@@ -788,6 +832,7 @@ def main():
     have.update(cfg.get('have') or [])
     have.update(memo().get('done', []))  # v45
     rt_links(cfg)  # v43: pictures and links for the Кафедра (a few seconds)
+    films(cfg)  # v49: the film library's descriptions (a light model, about 10 minutes at most)
     try:
         run_pending(have)  # v44: transcripts already made, first
     except Daily as e:
