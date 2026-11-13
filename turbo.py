@@ -10,7 +10,7 @@ them quietly (Google Doc, members' PDF, library card, long-term memory). Nothing
 Runs for up to ~5.5 hours, then the next run continues. Uses its own Gemini key (GEMINI_KEY), so faithBOT's
 own daily quota stays for new sermons and the Pastor.
 v41: also finds the recording of any church note without a transcript and transcribes it (timestamps), and at
-night (Dubai 22:00–07:00) studies every message once for the Pastor. After 21 Nov 2026 only these quiet jobs run.
+night (Dubai 22:00–07:00) studies every message once for the Pastor. After 22 Nov 2026, 18:00 Dubai only these quiet jobs run.
 Secrets: TG_API_ID, TG_API_HASH, TG_SESSION, FAITHBOT_URL, FAITHBOT_KEY, GEMINI_KEY
 """
 import asyncio, glob, json, os, re, shutil, subprocess, sys, tempfile, time
@@ -608,12 +608,12 @@ def rt_links(cfg):
     for v in vids:
         day.setdefault(v['date'], []).append(v)
 
-    def near(d, k):  # the same preacher one day before or after (an upload a day late)
+    def near(d, k):  # the same preacher a few days before or after (a late upload)
         try:
             t = datetime.strptime(d, '%d.%m.%Y')
         except ValueError:
             return ''
-        for off in (1, -1):
+        for off in (1, -1, 2, -2, 3, -3):  # v50: an upload up to three days late or early
             dd = (t + __import__('datetime').timedelta(days=off)).strftime('%d.%m.%Y')
             for v in day.get(dd, []):
                 if kkey(dd, v['speaker']).endswith(k):
@@ -819,7 +819,7 @@ def main():
         shutil.rmtree(TMP, ignore_errors=True)
         return
     if cfg.get('ended'):
-        print('The archive is closed (21 Nov 2026): faithBOT now makes notes only of new recordings. Nothing to do.')
+        print('The archive is closed (22 Nov 2026, 18:00 Dubai): faithBOT now makes notes only of new recordings. Nothing to do.')
         return
     if cfg.get('pause'):
         sys.exit('Paused by faithBOT.')
@@ -849,15 +849,15 @@ def main():
     rounds = 0
     while left_min() > 10 and rounds < 50:
         rounds += 1
-        try:  # v40 order: Горница, then every Кафедра from Rutube (audio), then the morning words, then any Кафедра only on YouTube
-            asyncio.run(telegram(cfg, have, ['gornitsa']))
+        try:  # v50 order: Кафедра first (Rutube audio, then any only on YouTube), then Горница, then the morning words
             if cfg.get('end'):  # faithBOT v40 or newer (it knows Rutube ids and the two preachers of one day)
                 rutube_kafedra(cfg, have)
+            kafedra(cfg, have)
+            asyncio.run(telegram(cfg, have, ['gornitsa']))
             asyncio.run(telegram(cfg, have, ['morning']))
         except Daily as e:
             log('⏸ Gemini\'s free daily limit: the next run continues', e)
             break
-        kafedra(cfg, have)
         cfg = bot('turbo_cfg')
         if cfg.get('pause') or not (cfg.get('yt') and not YT_SPENT) or left_min() < 40:
             break
