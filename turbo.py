@@ -23,10 +23,11 @@ KEYS = [k for k in [os.environ.get(n, '').strip() for n in ('GEMINI_KEY', 'GEMIN
 GKEY = KEYS[0] if KEYS else ''
 STARTED = time.time()
 LIMIT_MIN = float(os.environ.get('TURBO_MINUTES', '330'))
-CHUNK = 15 * 60                 # transcription parts of 15 minutes
+CHUNK = 30 * 60                 # v46: transcription parts of 30 minutes (half the requests)
 GAPI = 'https://generativelanguage.googleapis.com'
 WRITE_MODELS = ['gemini-flash-latest', 'gemini-flash-lite-latest', 'gemini-2.5-flash']  # the last only when the others are overloaded
 FAST_MODELS = ['gemini-flash-lite-latest', 'gemini-flash-latest']
+TR_MODELS = ['gemini-flash-lite-latest', 'gemini-flash-latest']  # v46: transcription on Flash-Lite (its own, larger daily allowance); Flash kept for the notes
 TMP = tempfile.mkdtemp(prefix='turbo-')
 SPENT = set()                   # models whose daily quota is used up (or that keep timing out) in this run
 SLOW = {}                       # timeouts per model
@@ -185,7 +186,7 @@ def transcribe_audio(path, prompt):
         info = upload(p, 'audio/mpeg')
         try:
             q = prompt.replace('{PART}', str(i + 1)).replace('{PARTS}', str(len(files))).replace('{RANGE}', '')
-            text, _ = gemini(WRITE_MODELS, [{'text': q}, {'file_data': {'file_uri': info['uri'], 'mime_type': 'audio/mpeg'}}])
+            text, _ = gemini(TR_MODELS, [{'text': q}, {'file_data': {'file_uri': info['uri'], 'mime_type': 'audio/mpeg'}}], max_tokens=60000)
         finally:
             forget(info)
         text = text.replace('[[END]]', '').strip()
@@ -204,7 +205,7 @@ def transcribe_youtube(vid, length, prompt):
         q = prompt.replace('{PART}', str(n + 1)).replace('{PARTS}', str(parts or '?')).replace('{RANGE}', ', covering %s–%s of the recording' % (clock(pos), clock(end)))
         media = {'file_data': {'file_uri': 'https://www.youtube.com/watch?v=' + vid}, 'video_metadata': {'start_offset': '%ds' % max(0, pos - 5), 'end_offset': '%ds' % end, 'fps': 0.2}}
         try:
-            text, _ = gemini(WRITE_MODELS, [{'text': q}, media])
+            text, _ = gemini(TR_MODELS, [{'text': q}, media], max_tokens=60000)
         except RuntimeError as e:
             if n and '400' in str(e):
                 break  # past the end of a video of unknown length
@@ -327,7 +328,7 @@ def member_edition(pr, md):
     if not pr.get('member'):
         return ''
     try:
-        ru, _ = gemini(WRITE_MODELS, [{'text': pr['member'].replace('{NOTES}', md)}], max_tokens=65536)
+        ru, _ = gemini(FAST_MODELS, [{'text': pr['member'].replace('{NOTES}', md)}], max_tokens=65536)  # v46: the Russian edition on Flash-Lite
         ru = re.sub(r'\n```\s*$', '', re.sub(r'^```(?:markdown|md)?\s*\n', '', ru.strip())).strip()
         return ru if len(ru) > 300 else ''
     except Exception as e:
