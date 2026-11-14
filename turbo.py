@@ -338,6 +338,25 @@ def member_edition(pr, md):
         return ''
 
 
+def editions(cfg):
+    """v51: the Russian edition of every church message that has none yet (newest first), so Russian readers always get Russian."""
+    for it in (cfg.get('med') or []):
+        if left_min() < 25:
+            return
+        try:
+            src = bot('turbo_md', id=it['id']) or {}
+            if not src.get('md') or not src.get('member'):
+                continue
+            log('🇷🇺 edition: %s %s «%s»' % (it['kind'], it['date'], it['title'][:50]))
+            ru = member_edition({'member': src['member']}, src['md'])
+            r = bot('turbo_med', id=it['id'], ru=ru)
+            log('  ✓ saved' if r.get('ok') else '  · %s' % str(r)[:100])
+        except Daily:
+            return
+        except Exception as e:
+            log('  · edition skipped:', str(e)[:100])
+
+
 def redo(cfg):
     """v39: older church notes rewritten in the new format from their transcripts (the same Google Doc, its link stays)."""
     fails = memo().get('redofail', {})
@@ -879,6 +898,7 @@ def main():
     if not cfg.get('pause') and not fresh(cfg, have):  # v51: the new recordings, before anything else
         shutil.rmtree(TMP, ignore_errors=True)
         return
+    editions(cfg)  # v51: Russian editions for every message, right after the new recordings
     redo(cfg)  # v39: the notes you already have, in the new format (no transcription needed: quick)
     rounds = 0
     while left_min() > 10 and rounds < 50:
