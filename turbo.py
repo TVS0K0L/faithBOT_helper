@@ -1006,8 +1006,6 @@ def main():
     have = HAVE
     have.update(cfg.get('have') or [])
     have.update(memo().get('done', []))  # v45
-    rt_links(cfg)  # v43: pictures and links for the Кафедра (a few seconds)
-    films(cfg)  # v49: the film library's descriptions (a light model, about 10 minutes at most)
     try:
         run_pending(have)  # v44: transcripts already made, first
     except Daily as e:
@@ -1028,6 +1026,8 @@ def main():
     if not ministries(cfg, have):  # v52: then the YouTube ministries, in your order, newest first
         shutil.rmtree(TMP, ignore_errors=True)
         return
+    rt_links(cfg)  # v43: pictures and links for the Кафедра (a few seconds); v52: after the new recordings
+    films(cfg)  # v49: the film library's descriptions; v52: never before the church's new recordings
     editions(cfg)  # v51: Russian editions for every message, right after the new recordings
     redo(cfg)  # v39: the notes you already have, in the new format (no transcription needed: quick)
     rounds = 0
