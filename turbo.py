@@ -545,13 +545,18 @@ async def fetch_post(client, msg):
 # ---------------------------------------------------------------------- YouTube: the Кафедра archive
 def kafedra(cfg, have):
     for v in cfg.get('yt') or []:
-        if left_min() < 15 or YT_SPENT:
+        if left_min() < 15:
             return
         if v.get('date') and kkey(v['date'], v.get('speaker', '')) in have:
             continue
         log('📝 kafedra', v.get('date'), (v.get('title') or '')[:60])
         try:
-            tr, total = transcribe_youtube(v['id'], v.get('len') or 0, cfg['transcribe'])
+            mp3 = yt_audio(v['id'])  # v52: the sound as a small MP3 first (quicker, no YouTube allowance); the video only if YouTube refuses
+            if mp3:
+                tr, total = transcribe_audio(mp3, cfg['transcribe'])
+                os.remove(mp3)
+            else:
+                tr, total = transcribe_youtube(v['id'], v.get('len') or 0, cfg['transcribe'])
             if len(tr) < 200:
                 bot('turbo_skip', yt=v['id'])
                 continue
