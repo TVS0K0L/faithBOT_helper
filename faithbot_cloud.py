@@ -19,7 +19,7 @@ import requests
 URL = os.environ.get('FAITHBOT_URL', '').strip()
 KEY = os.environ.get('FAITHBOT_KEY', '').strip()
 MIN_MB = 45          # smaller videos faithBOT fetches from the channel itself
-RECENT_DAYS = 3      # only posts this new are considered
+RECENT_DAYS = 14     # v51: posts this new are considered (a missed day is never lost)
 TMP = tempfile.mkdtemp(prefix='faithbot-')
 STARTED = time.time()
 BUDGET_MIN = 32       # the backlog stops after this many minutes of a run (GitHub allows 45)
@@ -202,6 +202,10 @@ async def telegram(state):
                     new_seen.append(key)
                     continue
                 title, date = details(text, msg.date)
+                if state.get('turbo'):  # v51: the backlog helper makes these notes itself (no load on faithBOT's 90 minutes)
+                    log('→', key, title, date, ': the backlog helper makes its notes this hour')
+                    new_seen.append(key)
+                    continue
                 log('⬇️', key, title, '%.0f MB' % size_mb if msg.video else post_link(msg))
                 mp3 = os.path.join(TMP, 'tg.mp3')
                 ok = await post_audio(msg, mp3, client)

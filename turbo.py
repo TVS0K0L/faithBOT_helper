@@ -386,18 +386,16 @@ def details(text, date):
         title += ' (%s)' % part[1]
     m = re.search(r'(?:Запись от|от)\s*(\d{1,2})\.(\d{1,2})\.(\d{4})', text or '')
     d = '%02d.%02d.%s' % (int(m[1]), int(m[2]), m[3]) if m else date.strftime('%d.%m.%Y')
-    sp = ''
+    sp = ''  # v51: only our two pastors are named from the post; anyone else is named by faithBOT from the recording itself
     first = (text or '').split('\n')[0]
     if re.search(r'Матюжов(?!а)', first, re.I):
         sp = 'Епископ Андрей Матюжов'
     elif re.search(r'Матюжов', first, re.I):
         sp = 'Пастор Ольга Матюжова'
-    else:
-        sp = (re.search(r'\sс\s+(.+)$', first) or [None, ''])[1].strip()
     return title[:120], d, sp
 
 
-async def telegram(cfg, have, kinds=None):
+async def telegram(cfg, have, kinds=None, fresh_days=0):
     from telethon import TelegramClient
     from telethon.sessions import StringSession
     before = datetime.fromisoformat(cfg['before'].replace('Z', '+00:00'))
@@ -408,8 +406,15 @@ async def telegram(cfg, have, kinds=None):
             ch = str(src['ch'])
             entity = await client.get_entity(int(ch) if re.match(r'^-?\d+$', ch) else ch)
             need, skip = re.compile(src['need'], re.I), re.compile(src['skip'], re.I)
+            if src['kind'] == 'morning':  # v51: the lesson now comes as «💭 Форум на утреннее сосредоточение «…» 📺 VK Видео»; only the live-start notices are skipped
+                skip = re.compile(r'^\s*Начинаем|zoom\.us', re.I)
             todo = []
-            async for msg in client.iter_messages(entity, offset_date=before, reply_to=src.get('topic') or None):
+            kw = {'reply_to': src.get('topic') or None}
+            if not fresh_days:
+                kw['offset_date'] = before
+            async for msg in client.iter_messages(entity, **kw):
+                if fresh_days and (time.time() - msg.date.timestamp()) > fresh_days * 86400:
+                    break  # v51: the new recordings only (newest first)
                 text = msg.message or ''
                 if not (msg.video or post_link(msg)) or not need.search(text) or skip.search(text):
                     continue
@@ -418,8 +423,9 @@ async def telegram(cfg, have, kinds=None):
                     continue
                 todo.append(msg)
             totals[src['kind']] = len(todo)
-            bot('turbo_totals', totals={src['kind']: len(todo)})
-            log('%s: %d in the archive' % (src['kind'], len(todo)))
+            if not fresh_days:
+                bot('turbo_totals', totals={src['kind']: len(todo)})
+            log('%s: %d %s' % (src['kind'], len(todo), 'new (last %d days)' % fresh_days if fresh_days else 'in the archive'))
             for msg in todo:  # newest first
                 if left_min() < 10:
                     return
@@ -497,6 +503,28 @@ def kafedra(cfg, have):
 RUTUBE = '30869662'  # the church's Rutube channel: every Кафедра of Bishop Andrey and Pastor Olga since 2023
 
 
+def recent_date(d, days):
+    try:
+        return (datetime.now() - datetime.strptime(d, '%d.%m.%Y')).days <= days
+    except ValueError:
+        return False
+
+
+FRESH_DAYS = 21  # v51: recordings this new are the church's new ones: done first, every hour, and sent to everyone
+
+
+def fresh(cfg, have):
+    """v51: the newest Кафедра, Горница and morning words first, before any archive work."""
+    try:
+        if cfg.get('end'):
+            rutube_kafedra(cfg, have, FRESH_DAYS)
+        asyncio.run(telegram(cfg, have, ['gornitsa', 'morning'], FRESH_DAYS))
+    except Daily as e:
+        log('⏸ Gemini\'s free daily limit: the next run continues', e)
+        return False
+    return True
+
+
 def kkey(date, speaker):
     """A Кафедра is known by its date and preacher (both preach on some Sundays)."""
     return 'kafedra|%s|%s' % (date, 'o' if re.search(r'Ольг|Olga', speaker or '', re.I) else 'a')
@@ -558,15 +586,18 @@ def rutube_audio(vid):
     return mp3
 
 
-def rutube_kafedra(cfg, have):
+def rutube_kafedra(cfg, have, fresh_days=0):
     """v40: every Кафедра from Rutube as small audio (about 8 MB an hour): fast, and no daily YouTube limit."""
     try:
         todo = [v for v in rutube_list() if 'rt:' + v['id'] not in have and not (v['dated'] and kkey(v['date'], v['speaker']) in have)]
+        if fresh_days:  # v51: the new Кафедра only
+            todo = [v for v in todo if v['dated'] and recent_date(v['date'], fresh_days)]
     except Exception as e:
         log('Rutube: list failed:', str(e)[:120])
         return
-    bot('turbo_totals', totals={'kafedra': len(todo) + sum(1 for h in have if h.startswith('kafedra|'))})
-    log('kafedra (Rutube): %d to do' % len(todo))
+    if not fresh_days:
+        bot('turbo_totals', totals={'kafedra': len(todo) + sum(1 for h in have if h.startswith('kafedra|'))})
+    log('kafedra (Rutube): %d to do%s' % (len(todo), ' (new)' if fresh_days else ''))
     for v in todo:
         if left_min() < 25:
             return
@@ -845,6 +876,9 @@ def main():
                 have.add('rt:' + m['rt'])
         except Exception:
             pass
+    if not cfg.get('pause') and not fresh(cfg, have):  # v51: the new recordings, before anything else
+        shutil.rmtree(TMP, ignore_errors=True)
+        return
     redo(cfg)  # v39: the notes you already have, in the new format (no transcription needed: quick)
     rounds = 0
     while left_min() > 10 and rounds < 50:

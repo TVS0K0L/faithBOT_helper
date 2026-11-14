@@ -1,10 +1,10 @@
 # faithBOT · the backlog on GitHub: full notes of every old Кафедра, Горница and morning word (until 21 Nov 2026);
 # v41: then, quietly, the missing transcripts and the night study for the Pastor (Dubai 22:00–07:00).
-# Each run works up to ~5.5 hours; a new one starts every 6 hours (and faithBOT starts one if GitHub skips it).
+# v51: every hour, the new Кафедра, Горница and morning words first (sent to everyone), then the archive.
 name: faithBOT backlog
 on:
   schedule:
-    - cron: '20 */6 * * *'
+    - cron: '20 * * * *'  # v51: hourly; the new recordings come first in every run (a run still in progress just carries on)
   workflow_dispatch:
 concurrency:
   group: faithbot-turbo
