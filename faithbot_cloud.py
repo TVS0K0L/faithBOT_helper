@@ -186,6 +186,9 @@ async def telegram(state):
                 age_days = (time.time() - msg.date.timestamp()) / 86400
                 text = msg.message or ''
                 if age_days > RECENT_DAYS or not (msg.video or post_link(msg)) or not need.search(text) or skip.search(text):
+                    if age_days <= RECENT_DAYS and (msg.video or msg.document or post_link(msg) or need.search(text)):  # say why a recent post was passed over
+                        why = 'no video or link' if not (msg.video or post_link(msg)) else 'no «%s»' % src['need'] if not need.search(text) else 'forum'
+                        log('· skipped', key, msg.date.strftime('%d.%m %H:%M'), why, '|', re.sub(r'\s+', ' ', text)[:140])
                     if age_days > RECENT_DAYS or first:
                         new_seen.append(key)
                     continue
@@ -212,6 +215,7 @@ async def telegram(state):
                     new_seen.append(key)
                     if res is True:
                         tell('✅ %s «%s» %s → Drive' % (src['folder'], title, date), notify=True)  # you see each new recording arrive
+            log('Telegram %s (%s): checked' % (src['folder'], ch))
         if new_seen:
             bot('seen', posts=new_seen)
         await backlog(client, state)
