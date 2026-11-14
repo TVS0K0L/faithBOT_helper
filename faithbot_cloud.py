@@ -177,7 +177,7 @@ async def telegram(state):
         if any(s.get('priv') for s in state.get('sources') or []):
             await client.get_dialogs()  # private groups are known by number only after this
         for src in state.get('sources') or []:
-            ch, need, skip = src['ch'], re.compile(src['need'], re.I), re.compile(src['skip'], re.I)
+            ch, need, skip = src['ch'], re.compile(src['need'], re.I), re.compile(r'форум|^\s*Начинаем|zoom\.us', re.I)  # v51: never a forum post
             entity = await client.get_entity(int(ch) if re.match(r'^-?\d+$', str(ch)) else ch)
             async for msg in client.iter_messages(entity, limit=60 if src.get('priv') else 12, reply_to=src.get('topic') or None):  # a busy group: look further back
                 key = '%s/%s' % (ch, msg.grouped_id or msg.id)
@@ -240,7 +240,7 @@ async def backlog(client, state):
         ch = str(src['ch'])
         if ch in done:
             continue
-        need, skip = re.compile(src['need'], re.I), re.compile(src['skip'], re.I)
+        need, skip = re.compile(src['need'], re.I), re.compile(r'форум|^\s*Начинаем|zoom\.us', re.I)  # v51: never a forum post
         entity = await client.get_entity(int(ch) if re.match(r'^-?\d+$', ch) else ch)
         kw = {'reply_to': src.get('topic') or None}
         if pos.get(ch):

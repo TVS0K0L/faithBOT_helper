@@ -424,9 +424,8 @@ async def telegram(cfg, have, kinds=None, fresh_days=0):
         for src in sorted([x for x in cfg['sources'] if not kinds or x['kind'] in kinds], key=lambda x: 0 if x['kind'] == 'gornitsa' else 1):  # v40: Горница first
             ch = str(src['ch'])
             entity = await client.get_entity(int(ch) if re.match(r'^-?\d+$', ch) else ch)
-            need, skip = re.compile(src['need'], re.I), re.compile(src['skip'], re.I)
-            if src['kind'] == 'morning':  # v51: the lesson now comes as «💭 Форум на утреннее сосредоточение «…» 📺 VK Видео»; only the live-start notices are skipped
-                skip = re.compile(r'^\s*Начинаем|zoom\.us', re.I)
+            need, skip = re.compile(src['need'], re.I), re.compile(r'форум|^\s*Начинаем|zoom\.us', re.I)  # v51: never a forum post
+            skip = re.compile(r'форум|^\s*Начинаем|zoom\.us', re.I)  # v51: never a forum post (morning word or Горница), never the live-start notice
             todo = []
             kw = {'reply_to': src.get('topic') or None}
             if not fresh_days:
@@ -750,7 +749,7 @@ async def post_index(cfg):
     for src in [x for x in cfg.get('sources') or [] if x['kind'] in ('gornitsa', 'morning')]:
         ch = str(src['ch'])
         entity = await client.get_entity(int(ch) if re.match(r'^-?\d+$', ch) else ch)
-        need, skip = re.compile(src['need'], re.I), re.compile(src['skip'], re.I)
+        need, skip = re.compile(src['need'], re.I), re.compile(r'форум|^\s*Начинаем|zoom\.us', re.I)  # v51: never a forum post
         async for msg in client.iter_messages(entity, reply_to=src.get('topic') or None):
             text = msg.message or ''
             if not (msg.video or post_link(msg)) or not need.search(text) or skip.search(text):
