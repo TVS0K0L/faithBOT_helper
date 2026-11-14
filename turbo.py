@@ -74,11 +74,11 @@ def gemini(models, parts, max_tokens=32768, as_json=False):
             if any('file_data' in p and 'youtube' in p['file_data'].get('file_uri', '') for p in parts):
                 body['generationConfig']['mediaResolution'] = 'MEDIA_RESOLUTION_LOW'
             try:
-                r = requests.post('%s/v1beta/models/%s:generateContent?key=%s' % (GAPI, model, GKEY), json=body, timeout=600)
+                r = requests.post('%s/v1beta/models/%s:generateContent?key=%s' % (GAPI, model, GKEY), json=body, timeout=300)
             except Exception as e:
                 last = str(e)[:120]
                 SLOW[model] = SLOW.get(model, 0) + 1
-                if SLOW[model] >= 2:  # it keeps hanging: the next model for the rest of this run
+                if SLOW[model] >= 1:  # v52: one hang (5 minutes) is enough: the next model for the rest of this run
                     SPENT.add(model)
                     break
                 time.sleep(20)
@@ -101,8 +101,10 @@ def gemini(models, parts, max_tokens=32768, as_json=False):
                     break
                 time.sleep(45)
                 continue
-            if r.status_code in (500, 502, 503, 504):  # overloaded: wait longer each time (30 s … 4 min) instead of giving up
-                time.sleep(min(240, 30 * 2 ** attempt))
+            if r.status_code in (500, 502, 503, 504):  # v52: overloaded: two short waits (20 s, 40 s), then the next model (never half an hour on one)
+                if attempt >= 2:
+                    break
+                time.sleep(20 * (attempt + 1))
                 continue
             if r.status_code == 404:
                 SPENT.add(model)
@@ -978,11 +980,11 @@ def main():
         have = HAVE
         have.update(cfg.get('have') or [])
         have.update(memo().get('done', []))
-        try:
-            run_pending(have)
-        except Daily as e:
-            log('⏸', e)
-        if fresh(cfg, have) and ministries(cfg, have):
+        if fresh(cfg, have) and ministries(cfg, have):  # v52: the new recordings and the ministries first
+            try:
+                run_pending(have)
+            except Daily as e:
+                log('⏸', e)
             editions(cfg)
             if left_min() > 20:
                 quiet(cfg)
@@ -1006,10 +1008,6 @@ def main():
     have = HAVE
     have.update(cfg.get('have') or [])
     have.update(memo().get('done', []))  # v45
-    try:
-        run_pending(have)  # v44: transcripts already made, first
-    except Daily as e:
-        log('⏸', e)
     for path in glob.glob(os.path.join(PEND, '*.json')):  # still waiting: never transcribed again in this run
         try:
             m = json.load(open(path, encoding='utf-8'))['meta']
@@ -1026,6 +1024,10 @@ def main():
     if not ministries(cfg, have):  # v52: then the YouTube ministries, in your order, newest first
         shutil.rmtree(TMP, ignore_errors=True)
         return
+    try:
+        run_pending(have)  # v44: transcripts already made (only their notes to write); v52: after the new recordings
+    except Daily as e:
+        log('⏸', e)
     rt_links(cfg)  # v43: pictures and links for the Кафедра (a few seconds); v52: after the new recordings
     films(cfg)  # v49: the film library's descriptions; v52: never before the church's new recordings
     editions(cfg)  # v51: Russian editions for every message, right after the new recordings
