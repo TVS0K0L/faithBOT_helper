@@ -244,7 +244,7 @@ def memo_save(m):
 
 def mark_done(meta):
     m = memo()
-    for k in ['%s|%s' % (meta.get('kind'), meta.get('date'))] + (['rt:' + meta['rt']] if meta.get('rt') else []):
+    for k in ['%s|%s' % (meta.get('kind'), meta.get('date'))] + (['rt:' + meta['rt']] if meta.get('rt') else []) + (['yt:' + meta['yt']] if meta.get('yt') else []):
         if k not in m['done']:
             m['done'].append(k)
         HAVE.add(k)
@@ -397,6 +397,43 @@ def post_link(msg):
     return next((u for u in urls if re.match(r'https?://(?:www\.|m\.)?(?:vk\.com/(?:video|clip)|vkvideo\.ru/(?:video|clip)|vk\.ru/video)', u, re.I)), None)
 
 
+NOM = [('ским', 'ский'), ('цким', 'цкий'), ('ской', 'ская'), ('цкой', 'цкая'), ('овым', 'ов'), ('евым', 'ев'), ('ёвым', 'ёв'), ('иным', 'ин'), ('ыным', 'ын'),
+       ('овой', 'ова'), ('евой', 'ева'), ('ёвой', 'ёва'), ('иной', 'ина'), ('ыной', 'ына'), ('ием', 'ий'), ('ией', 'ия'), ('ьёй', 'ья'), ('ьей', 'ья'),
+       ('еем', 'ей'), ('аем', 'ай'), ('уем', 'уй'), ('оем', 'ой')]
+
+
+def nom_word(w):
+    """v52: one Russian name from the instrumental case («Антоном», «Евцихевичем», «Леденевым») to the nominative."""
+    lo = w.lower()
+    for a, b in NOM:
+        if lo.endswith(a):
+            return w[:-len(a)] + b
+    if re.search(r'[жшчщц]ем$', lo):
+        return w[:-2]
+    if re.search(r'[жшчщц]ей$', lo):
+        return w[:-2] + 'а'
+    if lo.endswith('ем'):
+        return w[:-2] + 'ь'
+    if lo.endswith('ей'):
+        return w[:-2] + 'я'
+    if lo.endswith('ой'):
+        return w[:-2] + 'а'
+    if lo.endswith('ом'):
+        return w[:-2]
+    return w
+
+
+def post_speaker(text):
+    """v52: «Утреннее сосредоточение с Антоном Евцихевичем «…»» → Антон Евцихевич (the bishop keeps his rank, faithBOT adds it)."""
+    m = re.search(r'сосредоточени\w*\s+с\s+((?:[А-ЯЁа-яё-]+\s+){0,3}?[А-ЯЁ][а-яё-]+)\s*[«"“]', text or '')
+    if not m:
+        return ''
+    words = [w for w in m[1].split() if not re.match(r'^(епископ|пастор|апостол|брат|сестр)\w*$', w, re.I)]
+    if not 1 <= len(words) <= 3 or not all(re.match(r'^[А-ЯЁ]', w) for w in words):
+        return ''
+    return ' '.join(nom_word(w) for w in words)
+
+
 def details(text, date):
     title = (re.search(r'«([^»]+)»', text or '') or [None, ''])[1] or (text or '').split('\n')[0]
     title = re.sub(r'\s*\+\s*форум.*$', '', title, flags=re.I).strip()
@@ -405,9 +442,13 @@ def details(text, date):
         title += ' (%s)' % part[1]
     m = re.search(r'(?:Запись от|от)\s*(\d{1,2})\.(\d{1,2})\.(\d{4})', text or '')
     d = '%02d.%02d.%s' % (int(m[1]), int(m[2]), m[3]) if m else date.strftime('%d.%m.%Y')
-    sp = ''  # v51: only our two pastors are named from the post; anyone else is named by faithBOT from the recording itself
+    sp = post_speaker(text)  # v52: the name the church gives in the post (faithBOT adds the rank only for Bishop Andrey and Pastor Olga)
     first = (text or '').split('\n')[0]
-    if re.search(r'Матюжов(?!а)', first, re.I):
+    if sp and 'Матюжов' in sp:
+        sp = 'Пастор Ольга Матюжова' if re.search(r'Ольг', sp) else 'Епископ Андрей Матюжов'
+    elif sp:
+        pass
+    elif re.search(r'Матюжов(?!а)', first, re.I):
         sp = 'Епископ Андрей Матюжов'
     elif re.search(r'Матюжов', first, re.I):
         sp = 'Пастор Ольга Матюжова'
@@ -424,9 +465,8 @@ async def telegram(cfg, have, kinds=None, fresh_days=0):
         for src in sorted([x for x in cfg['sources'] if not kinds or x['kind'] in kinds], key=lambda x: 0 if x['kind'] == 'gornitsa' else 1):  # v40: Горница first
             ch = str(src['ch'])
             entity = await client.get_entity(int(ch) if re.match(r'^-?\d+$', ch) else ch)
-            need, skip = re.compile(src['need'], re.I), re.compile(r'форум|^\s*Начинаем|zoom\.us', re.I)  # v51: never a forum post
-            skip = re.compile(r'форум|^\s*Начинаем|zoom\.us', re.I)  # v51: never a forum post (morning word or Горница), never the live-start notice
-            todo = []
+            need, skip = re.compile(src['need'], re.I), re.compile(r'форум|^\s*Начинаем|zoom\.us', re.I)  # v52: never a forum post (morning word or Горница), never the live-start notice
+            todo, meta = [], []
             kw = {'reply_to': src.get('topic') or None}
             if not fresh_days:
                 kw['offset_date'] = before
@@ -434,12 +474,20 @@ async def telegram(cfg, have, kinds=None, fresh_days=0):
                 if fresh_days and (time.time() - msg.date.timestamp()) > fresh_days * 86400:
                     break  # v51: the new recordings only (newest first)
                 text = msg.message or ''
+                if fresh_days and (msg.video or post_link(msg)) and need.search(text) and not re.match(r'^\s*Начинаем', text):  # v52: names and forum posts of what the library already has
+                    t_, d_, s_ = details(text, msg.date)
+                    if '%s|%s' % (src['kind'], d_) in have:
+                        meta.append({'kind': src['kind'], 'date': d_, 'title': t_, 'speaker': s_, 'forum': bool(re.search('форум', text, re.I))})
                 if not (msg.video or post_link(msg)) or not need.search(text) or skip.search(text):
                     continue
                 dur = next((a.duration for a in (msg.document.attributes or []) if hasattr(a, 'duration')), 0) if msg.video else 0
                 if dur and dur < src['min'] * 60:
                     continue
                 todo.append(msg)
+            if meta:
+                r = bot('turbo_meta', items=meta)
+                if r.get('fixed') or r.get('removed'):
+                    log('%s: %s names fixed, %s forum posts taken out of the library' % (src['kind'], r.get('fixed', 0), r.get('removed', 0)))
             totals[src['kind']] = len(todo)
             if not fresh_days:
                 bot('turbo_totals', totals={src['kind']: len(todo)})
@@ -515,6 +563,64 @@ def kafedra(cfg, have):
         except Exception as e:
             log('  ⚠️', str(e)[:160])
             bot('turbo_skip', yt=v['id'])
+
+
+# ---------------------------------------------------------------------- v52: the YouTube ministries
+def yt_audio(vid):
+    """The sound of a YouTube video as a small MP3 (no YouTube allowance used); None if YouTube refuses."""
+    src = os.path.join(TMP, 'yt-' + vid)
+    try:
+        subprocess.run([sys.executable, '-m', 'yt_dlp', '-q', '--no-warnings', '--no-playlist', '-f', 'worstaudio/bestaudio/worst', '-o', src + '.%(ext)s',
+                        'https://www.youtube.com/watch?v=' + vid], capture_output=True, timeout=900)
+    except Exception:
+        return None
+    got = [f for f in glob.glob(src + '.*') if not f.endswith('.part')]
+    if not got:
+        return None
+    mp3 = src + '.mp3'
+    if not got[0].endswith('.mp3'):
+        subprocess.run(['ffmpeg', '-nostdin', '-loglevel', 'error', '-y', '-i', got[0], '-vn', '-ac', '1', '-ar', '16000', '-c:a', 'libmp3lame', '-b:a', '32k', mp3], check=True)
+        os.remove(got[0])
+    return mp3
+
+
+def ministries(cfg, have):
+    """v52: after the church's own recordings, the YouTube ministries from faithBOT's queue, in your order
+    (Authentic Church, Vlad Savchuk, David Diga Hernandez, Aaron Burke, Brayden Steckler), newest first.
+    A video leaves the queue only when its notes are in; on Gemini's daily limit the next hourly run goes on."""
+    q = cfg.get('ministries') or []
+    if not q:
+        return True
+    log('🕊️ ministries: %d waiting' % len(q))
+    for v in q:
+        if left_min() < 25:
+            return True
+        if 'yt:' + v['id'] in have:
+            continue
+        log('📝 %s %s «%s»' % (v.get('channel', ''), v.get('date', ''), (v.get('title') or '')[:60]))
+        try:
+            mp3 = yt_audio(v['id'])
+            if mp3:
+                tr, total = transcribe_audio(mp3, cfg['transcribe'])
+                os.remove(mp3)
+            elif not YT_SPENT:
+                tr, total = transcribe_youtube(v['id'], v.get('dur') or 0, cfg['transcribe'])
+            else:
+                log('  · YouTube refused the download and Gemini\'s YouTube allowance is used up: next run')
+                continue
+            if len(tr) < 200:
+                bot('turbo_ytfail', id=v['id'], why='no speech found')
+                continue
+            res = notes({'kind': 'youtube', 'title': v.get('title', ''), 'date': v.get('date', ''), 'speaker': v.get('speaker', ''), 'channel': v.get('channel', ''), 'yt': v['id']}, tr, total)
+            log('  ✅' if res.get('ok') else '  · %s' % str(res)[:100])
+            have.add('yt:' + v['id'])
+        except Daily as e:
+            log('⏸ Gemini\'s free daily limit: the ministries go on in the next run', e)
+            return False
+        except Exception as e:
+            log('  ⚠️', str(e)[:160])
+            bot('turbo_ytfail', id=v['id'], why=str(e)[:200])
+    return True
 
 
 # ---------------------------------------------------------------------- Rutube: the Кафедра as audio (no YouTube limit)
@@ -862,6 +968,21 @@ def main():
     global LIMIT_MIN
     os.makedirs(PEND, exist_ok=True)
     cfg = bot('turbo_cfg')
+    if cfg.get('after') and cfg.get('daily'):  # v52: the archive is closed: every new recording and the ministries go on, then the quiet work
+        log('The archive is closed: new recordings, the ministries, Russian editions, then the quiet work.')
+        have = HAVE
+        have.update(cfg.get('have') or [])
+        have.update(memo().get('done', []))
+        try:
+            run_pending(have)
+        except Daily as e:
+            log('⏸', e)
+        if fresh(cfg, have) and ministries(cfg, have):
+            editions(cfg)
+            if left_min() > 20:
+                quiet(cfg)
+        shutil.rmtree(TMP, ignore_errors=True)
+        return
     if cfg.get('after'):  # v41: the archive is closed (21 Nov 2026); transcripts, rewrites and the night study go on
         log('The archive is closed: missing transcripts, rewrites and the night study only.')
         quiet(cfg)
@@ -892,9 +1013,14 @@ def main():
             have.add('%s|%s' % (m.get('kind'), m.get('date')))
             if m.get('rt'):
                 have.add('rt:' + m['rt'])
+            if m.get('yt'):
+                have.add('yt:' + m['yt'])  # v52: a ministry video waiting for its notes is not transcribed again
         except Exception:
             pass
     if not cfg.get('pause') and not fresh(cfg, have):  # v51: the new recordings, before anything else
+        shutil.rmtree(TMP, ignore_errors=True)
+        return
+    if not ministries(cfg, have):  # v52: then the YouTube ministries, in your order, newest first
         shutil.rmtree(TMP, ignore_errors=True)
         return
     editions(cfg)  # v51: Russian editions for every message, right after the new recordings
