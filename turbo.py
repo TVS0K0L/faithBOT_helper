@@ -596,6 +596,17 @@ def yt_audio(vid):
     return mp3
 
 
+def yt_meta(vid):
+    """v54: a video's length and whether it was a live stream (yt-dlp, no download); {} when YouTube does not say."""
+    try:
+        r = subprocess.run([sys.executable, '-m', 'yt_dlp', '-J', '--skip-download', '--no-warnings', '--no-playlist', 'https://www.youtube.com/watch?v=' + vid],
+                           capture_output=True, text=True, timeout=120)
+        j = json.loads(r.stdout or '{}')
+        return {'dur': int(j.get('duration') or 0), 'live': j.get('live_status') or ''}
+    except Exception:
+        return {}
+
+
 def ministries(cfg, have):
     """v52: after the church's own recordings, the YouTube ministries from faithBOT's queue, in your order
     (Authentic Church, Vlad Savchuk, David Diga Hernandez, Aaron Burke, Brayden Steckler), newest first.
@@ -608,6 +619,13 @@ def ministries(cfg, have):
         if left_min() < 25:
             return True
         if 'yt:' + v['id'] in have:
+            continue
+        meta = yt_meta(v['id'])  # v54: the real length first (the bot can't see it)
+        if meta.get('live') in ('is_live', 'is_upcoming'):
+            continue  # still live or not started: the next run
+        if meta.get('live') in ('was_live', 'post_live') or (meta.get('dur') and meta['dur'] < 20 * 60):
+            log('  · %s: %s, left out' % ((v.get('title') or '')[:50], 'a live stream' if 'live' in meta.get('live', '') else '%d min' % (meta['dur'] // 60)))
+            bot('turbo_ytfail', id=v['id'], why='stream or short', drop=1)
             continue
         log('📝 %s %s «%s»' % (v.get('channel', ''), v.get('date', ''), (v.get('title') or '')[:60]))
         try:
@@ -622,6 +640,9 @@ def ministries(cfg, have):
                 continue
             if len(tr) < 200:
                 bot('turbo_ytfail', id=v['id'], why='no speech found')
+                continue
+            if total and total < 20 * 60:  # v54: the length only known now
+                bot('turbo_ytfail', id=v['id'], why='short', drop=1)
                 continue
             res = notes({'kind': 'youtube', 'title': v.get('title', ''), 'date': v.get('date', ''), 'speaker': v.get('speaker', ''), 'channel': v.get('channel', ''), 'yt': v['id']}, tr, total)
             log('  ✅' if res.get('ok') else '  · %s' % str(res)[:100])
