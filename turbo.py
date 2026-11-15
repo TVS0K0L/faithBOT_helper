@@ -44,16 +44,21 @@ def left_min():
     return LIMIT_MIN - (time.time() - STARTED) / 60
 
 
+ONCE = ('turbo_done', 'turbo_med', 'turbo_meta', 'turbo_fix')  # v52: these make files: sent once (a slow answer is not a failure: never twice)
+
+
 def bot(a, timeout=360, **body):
     body['a'] = a
-    for attempt in range(4):
+    once = a in ONCE
+    for attempt in range(1 if once else 4):
         try:
-            r = requests.post(URL, params={'helper': '1', 'k': KEY}, data=json.dumps(body), timeout=timeout,
+            r = requests.post(URL, params={'helper': '1', 'k': KEY}, data=json.dumps(body), timeout=600 if once else timeout,
                               headers={'Content-Type': 'text/plain;charset=utf-8'})
             return r.json()
         except Exception as e:
-            log('faithBOT not reachable (%s), retrying' % str(e)[:80])
-            time.sleep(10 * (attempt + 1))
+            log('faithBOT not reachable (%s)%s' % (str(e)[:80], '' if once else ', retrying'))
+            if not once:
+                time.sleep(10 * (attempt + 1))
     return {}
 
 
@@ -880,6 +885,18 @@ def night(cfg):
     return h >= a or h < b
 
 
+WIKI_IMG = {}
+
+
+def loads_loose(text):
+    """v53: JSON from a model, mended when it has stray backslashes or text around it."""
+    body = text[text.find('{'):text.rfind('}') + 1]
+    try:
+        return json.loads(body, strict=False)
+    except Exception:
+        return json.loads(re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', body), strict=False)
+
+
 def wiki_film(title, year, kind):
     """v49: the English Wikipedia summary of a film or series (the best match among the usual page names)."""
     names = ['%s (%s %s)' % (title, year, 'TV series' if kind == 'series' else 'film')] if year else []
@@ -892,6 +909,7 @@ def wiki_film(title, year, kind):
                 j = r.json()
                 ex = j.get('extract') or ''
                 if j.get('type') != 'disambiguation' and re.search(r'\b(film|movie|series|documentary|animated|television)\b', ex, re.I):
+                    WIKI_IMG[title] = (j.get('originalimage') or j.get('thumbnail') or {}).get('source', '')  # v53: its poster
                     return j.get('title') or n, ex
         except Exception:
             pass
@@ -905,23 +923,40 @@ def films(cfg):
     if not todo or not base:
         return
     n, t0 = 0, time.time()
-    for f in todo[:25]:
-        if time.time() - t0 > 600 or left_min() < 30:
+    for f in todo[:60]:
+        if time.time() - t0 > 900 or left_min() < 30:
             break
         title, intro = wiki_film(f['en'], f.get('year'), f.get('kind'))
         prompt = (base.replace('{KIND}', 'series' if f.get('kind') == 'series' else 'film').replace('{TITLE}', f['en'])
                   .replace('{YEAR}', str(f.get('year') or '?')).replace('{EN}', intro or '(not found)').replace('{REC}', '(none)').replace('{RU}', '(not found)'))
         try:
             text, _ = gemini(FAST_MODELS, [{'text': prompt}], max_tokens=6144, as_json=True)
-            r = json.loads(text[text.find('{'):text.rfind('}') + 1])
+            r = loads_loose(text)
         except Daily:
             break
         except Exception as e:
             log('  · film %s: %s' % (f['en'], str(e)[:80]))
             continue
-        out = bot('turbo_film', id=f['id'], r=r, wiki=title)
+        out = bot('turbo_film', id=f['id'], r=r, wiki=title, img=WIKI_IMG.get(f['en'], ''))
         n += 1 if out.get('ok') else 0
     log('🎬 films described: %d of %d waiting' % (n, len(todo)))
+
+
+def film_pics(cfg):
+    """v53: a poster for every film that has none (from its Wikipedia page; no AI needed)."""
+    todo = cfg.get('filmpics') or []
+    if not todo:
+        return
+    got = []
+    for f in todo:
+        if left_min() < 20:
+            break
+        wiki_film(f['en'], f.get('year'), f.get('kind'))
+        if WIKI_IMG.get(f['en']):
+            got.append({'id': f['id'], 'img': WIKI_IMG[f['en']]})
+    if got:
+        r = bot('turbo_filmpics', items=got)
+        log('🖼 film posters: %d found of %d (%s)' % (len(got), len(todo), 'saved' if r.get('ok') else r))
 
 
 def study(cfg):
@@ -974,6 +1009,18 @@ def main():
         sys.exit('FAITHBOT_URL, FAITHBOT_KEY and GEMINI_KEY are needed (GitHub → Settings → Secrets).')
     global LIMIT_MIN
     os.makedirs(PEND, exist_ok=True)
+    try:  # v52: the ministries' new videos into faithBOT's queue first (never waiting on faithBOT's own hourly check)
+        q = bot('turbo_ytscan', timeout=330)
+        if q.get('added'):
+            log('🕊️ %d new ministry videos queued' % q['added'])
+    except Exception:
+        pass
+    for _ in range(3):  # v52: the library put right (names «Title - date - speaker», no duplicates), a few minutes a run until done
+        r = bot('turbo_fix', timeout=330)
+        if r.get('renamed'):
+            log('📇 %d messages renamed and tidied' % r['renamed'])
+        if not r.get('ok') or r.get('done'):
+            break
     cfg = bot('turbo_cfg')
     if cfg.get('after') and cfg.get('daily'):  # v52: the archive is closed: every new recording and the ministries go on, then the quiet work
         log('The archive is closed: new recordings, the ministries, Russian editions, then the quiet work.')
@@ -986,6 +1033,7 @@ def main():
             except Daily as e:
                 log('⏸', e)
             editions(cfg)
+            film_pics(cfg)  # v53
             if left_min() > 20:
                 quiet(cfg)
         shutil.rmtree(TMP, ignore_errors=True)
@@ -1030,6 +1078,7 @@ def main():
         log('⏸', e)
     rt_links(cfg)  # v43: pictures and links for the Кафедра (a few seconds); v52: after the new recordings
     films(cfg)  # v49: the film library's descriptions; v52: never before the church's new recordings
+    film_pics(cfg)  # v53: posters for every film
     editions(cfg)  # v51: Russian editions for every message, right after the new recordings
     redo(cfg)  # v39: the notes you already have, in the new format (no transcription needed: quick)
     rounds = 0
