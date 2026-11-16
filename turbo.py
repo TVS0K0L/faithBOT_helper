@@ -14,7 +14,7 @@ night (Dubai 22:00–07:00) studies every message once for the Pastor. After 22 
 Secrets: TG_API_ID, TG_API_HASH, TG_SESSION, FAITHBOT_URL, FAITHBOT_KEY, GEMINI_KEY
 """
 import asyncio, glob, json, os, re, shutil, subprocess, sys, tempfile, time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import requests
 
 URL = os.environ.get('FAITHBOT_URL', '').strip()
@@ -93,6 +93,7 @@ def gemini(models, parts, max_tokens=32768, as_json=False):
                 cand = (j.get('candidates') or [{}])[0]
                 text = ''.join(p.get('text', '') for p in (cand.get('content') or {}).get('parts', []) if 'text' in p)
                 if text.strip():
+                    note_call()  # v55: counted against today's allowance
                     return text, model
                 last = 'empty answer (%s)' % cand.get('finishReason', '?')
                 break
@@ -117,6 +118,7 @@ def gemini(models, parts, max_tokens=32768, as_json=False):
     if all(m in SPENT for m in models):
         if next_key():  # v45: another Google account's free quota
             return gemini(models, parts, max_tokens, as_json)
+        quota_save(spent=True)  # v55: how much a day holds, learned from today
         raise Daily('Gemini daily quota used up (%s)' % last)
     raise RuntimeError('Gemini: ' + last)
 
@@ -249,6 +251,68 @@ def memo_save(m):
     json.dump(m, open(MEMO, 'w', encoding='utf-8'), ensure_ascii=False)
 
 
+# ---------------------------------------------------------------------- v55: the church's own messages first, every day
+# Gemini's free allowance renews at midnight Pacific (08:00 UTC, 12:00 Dubai). The morning word comes before that, so the archive,
+# the ministries and the films may use only part of each day's allowance: the rest is kept for the day's Кафедра, Горница and
+# morning word. How much a day holds is learned from the days it ran out (it changes, so it is averaged).
+QUOTA = {}
+RESERVE = 0.35  # the share kept for the church's own new messages
+
+
+def qday():
+    return (datetime.now(timezone.utc) - timedelta(hours=8)).strftime('%Y-%m-%d')
+
+
+def quota_load():
+    q = memo().get('quota') or {}
+    if q.get('day') != qday():
+        q = {'day': qday(), 'used': 0, 'cap': q.get('cap', 0)}
+    QUOTA.clear()
+    QUOTA.update(q)
+
+
+def quota_save(spent=False):
+    if not QUOTA:
+        return
+    if spent and QUOTA.get('used'):
+        cap = QUOTA.get('cap') or 0
+        QUOTA['cap'] = int(round(cap * 0.5 + QUOTA['used'] * 0.5)) if cap else QUOTA['used']
+    m = memo()
+    m['quota'] = dict(QUOTA)
+    memo_save(m)
+
+
+def note_call():
+    if not QUOTA:
+        return
+    if QUOTA.get('day') != qday():  # the allowance renewed during this run
+        QUOTA.update({'day': qday(), 'used': 0})
+    QUOTA['used'] = QUOTA.get('used', 0) + 1
+    if QUOTA['used'] % 5 == 0:
+        quota_save()
+
+
+def rest_ok():
+    """True while the archive, the ministries and the rest may still use today's allowance (the reserve stays for the church's own)."""
+    cap, used = QUOTA.get('cap') or 0, QUOTA.get('used') or 0
+    h = datetime.now(timezone.utc).hour
+    if not cap or 6 <= h < 8:  # not learned yet, or the last two hours before it renews (the morning word is in by then)
+        return True
+    return used < cap * (1 - RESERVE)
+
+
+REST_SAID = []
+
+
+def rest_gate():
+    if rest_ok():
+        return True
+    if not REST_SAID:
+        REST_SAID.append(1)
+        log('⏸ the rest waits: today\'s allowance is kept for the church\'s own Кафедра, Горница and morning word (%d of about %d used)' % (QUOTA.get('used', 0), QUOTA.get('cap', 0)))
+    return False
+
+
 def mark_done(meta):
     m = memo()
     for k in ['%s|%s' % (meta.get('kind'), meta.get('date'))] + (['rt:' + meta['rt']] if meta.get('rt') else []) + (['yt:' + meta['yt']] if meta.get('yt') else []):
@@ -273,16 +337,41 @@ def save_pending(meta, transcript, total):
         HAVE.add('rt:' + meta['rt'])
 
 
-def run_pending(have):
-    """v44: first the transcripts already made: only the notes are written (minutes, not hours)."""
-    files = sorted(glob.glob(os.path.join(PEND, '*.json')))
-    if files:
-        log('pending: %d transcripts waiting for their notes' % len(files))
-    for path in files:
+def is_fresh(m):
+    """v55: one of the church's own new messages (Кафедра, Горница, morning word of the last weeks): always first."""
+    try:
+        return m.get('kind') in ('kafedra', 'gornitsa', 'morning') and (datetime.now() - datetime.strptime(m.get('date', ''), '%d.%m.%Y')).days <= FRESH_DAYS
+    except Exception:
+        return False
+
+
+def run_pending(have, fresh_only=False):
+    """v44: first the transcripts already made: only the notes are written (minutes, not hours).
+    v55: the church's own new messages first (newest first); the archive's only while the day's reserve is untouched."""
+    items = []
+    for path in glob.glob(os.path.join(PEND, '*.json')):
+        try:
+            items.append((path, json.load(open(path, encoding='utf-8'))))
+        except Exception:
+            pass
+    def order(x):
+        m = x[1].get('meta', {})
+        try:
+            age = (datetime.now() - datetime.strptime(m.get('date', ''), '%d.%m.%Y')).days
+        except Exception:
+            age = 99999
+        return (0 if is_fresh(m) else 1, age)
+    items.sort(key=order)
+    if fresh_only:
+        items = [x for x in items if is_fresh(x[1].get('meta', {}))]
+    if items:
+        log('pending: %d transcripts waiting for their notes%s' % (len(items), ' (the church\'s new ones)' if fresh_only else ''))
+    for path, d in items:
         if left_min() < 15:
             return
+        if not is_fresh(d.get('meta', {})) and not rest_gate():
+            return
         try:
-            d = json.load(open(path, encoding='utf-8'))
             m = d['meta']
             log('📝 (kept) %s %s %s' % (m.get('kind'), m.get('date'), (m.get('title') or '')[:50]))
             res = notes(m, d['transcript'], d['total'], keep=False)
@@ -500,7 +589,7 @@ async def telegram(cfg, have, kinds=None, fresh_days=0):
                 bot('turbo_totals', totals={src['kind']: len(todo)})
             log('%s: %d %s' % (src['kind'], len(todo), 'new (last %d days)' % fresh_days if fresh_days else 'in the archive'))
             for msg in todo:  # newest first
-                if left_min() < 10:
+                if left_min() < 10 or (not fresh_days and not rest_gate()):  # v55: the archive stops at the day's reserve
                     return
                 title, date, sp = details(msg.message or '', msg.date)
                 if '%s|%s' % (src['kind'], date) in have:
@@ -552,7 +641,7 @@ async def fetch_post(client, msg):
 # ---------------------------------------------------------------------- YouTube: the Кафедра archive
 def kafedra(cfg, have):
     for v in cfg.get('yt') or []:
-        if left_min() < 15:
+        if left_min() < 15 or not rest_gate():  # v55
             return
         if v.get('date') and kkey(v['date'], v.get('speaker', '')) in have:
             continue
@@ -756,7 +845,7 @@ def rutube_kafedra(cfg, have, fresh_days=0):
         bot('turbo_totals', totals={'kafedra': len(todo) + sum(1 for h in have if h.startswith('kafedra|'))})
     log('kafedra (Rutube): %d to do%s' % (len(todo), ' (new)' if fresh_days else ''))
     for v in todo:
-        if left_min() < 25:
+        if left_min() < 25 or (not fresh_days and not rest_gate()):  # v55: the archive stops at the day's reserve
             return
         log('📝 kafedra', v['date'], v['speaker'].split()[-1], v['title'][:60])
         try:
@@ -1030,6 +1119,7 @@ def main():
         sys.exit('FAITHBOT_URL, FAITHBOT_KEY and GEMINI_KEY are needed (GitHub → Settings → Secrets).')
     global LIMIT_MIN
     os.makedirs(PEND, exist_ok=True)
+    quota_load()  # v55: today's allowance so far, and the share kept for the church's own new messages
     try:  # v52: the ministries' new videos into faithBOT's queue first (never waiting on faithBOT's own hourly check)
         q = bot('turbo_ytscan', timeout=330)
         if q.get('added'):
@@ -1042,21 +1132,36 @@ def main():
             log('📇 %d messages renamed and tidied' % r['renamed'])
         if not r.get('ok') or r.get('done'):
             break
+    try:  # v55: the quality check every run: copies, transcripts filed as notes, own files read back in, titles, speakers
+        q = bot('turbo_qc', timeout=330)
+        if q.get('restored'):
+            log('📇 library restored: %s' % q['restored'])
+        if q.get('fixed'):
+            log('🧪 quality check: %d fixed, %d to watch' % (q['fixed'], q.get('warn', 0)))
+    except Exception:
+        pass
     cfg = bot('turbo_cfg')
     if cfg.get('after') and cfg.get('daily'):  # v52: the archive is closed: every new recording and the ministries go on, then the quiet work
         log('The archive is closed: new recordings, the ministries, Russian editions, then the quiet work.')
         have = HAVE
         have.update(cfg.get('have') or [])
         have.update(memo().get('done', []))
-        if fresh(cfg, have) and ministries(cfg, have):  # v52: the new recordings and the ministries first
-            try:
-                run_pending(have)
-            except Daily as e:
-                log('⏸', e)
-            editions(cfg)
-            film_pics(cfg)  # v53
-            if left_min() > 20:
+        try:  # v55: the church's own new messages whose notes are still to write, first
+            run_pending(have, fresh_only=True)
+        except Daily as e:
+            log('⏸', e)
+        if fresh(cfg, have):  # v55: the church's own new messages always first; the rest only outside the day's reserve
+            if rest_gate() and ministries(cfg, have):
+                try:
+                    run_pending(have)
+                except Daily as e:
+                    log('⏸', e)
+                if rest_gate():
+                    editions(cfg)
+            film_pics(cfg)  # v53 (no AI)
+            if left_min() > 20 and rest_gate():
                 quiet(cfg)
+        quota_save()
         shutil.rmtree(TMP, ignore_errors=True)
         return
     if cfg.get('after'):  # v41: the archive is closed (21 Nov 2026); transcripts, rewrites and the night study go on
@@ -1087,23 +1192,34 @@ def main():
                 have.add('yt:' + m['yt'])  # v52: a ministry video waiting for its notes is not transcribed again
         except Exception:
             pass
-    if not cfg.get('pause') and not fresh(cfg, have):  # v51: the new recordings, before anything else
-        shutil.rmtree(TMP, ignore_errors=True)
-        return
-    if not ministries(cfg, have):  # v52: then the YouTube ministries, in your order, newest first
-        shutil.rmtree(TMP, ignore_errors=True)
-        return
-    try:
-        run_pending(have)  # v44: transcripts already made (only their notes to write); v52: after the new recordings
+    try:  # v55: the church's own new messages whose notes are still to write: before anything else
+        run_pending(have, fresh_only=True)
     except Daily as e:
         log('⏸', e)
-    rt_links(cfg)  # v43: pictures and links for the Кафедра (a few seconds); v52: after the new recordings
-    films(cfg)  # v49: the film library's descriptions; v52: never before the church's new recordings
-    film_pics(cfg)  # v53: posters for every film
-    editions(cfg)  # v51: Russian editions for every message, right after the new recordings
-    redo(cfg)  # v39: the notes you already have, in the new format (no transcription needed: quick)
+    if not cfg.get('pause') and not fresh(cfg, have):  # v51: the new recordings, before anything else
+        quota_save()
+        shutil.rmtree(TMP, ignore_errors=True)
+        return
+    rt_links(cfg)  # v43: pictures and links for the Кафедра (a few seconds, no AI)
+    film_pics(cfg)  # v53: posters for every film (no AI)
+    # v55: everything below uses the AI allowance: only while the day's reserve for the church's own new messages is untouched
+    if rest_gate() and not ministries(cfg, have):  # v52: then the YouTube ministries, in your order, newest first
+        quota_save()
+        shutil.rmtree(TMP, ignore_errors=True)
+        return
+    if rest_gate():
+        try:
+            run_pending(have)  # v44: transcripts already made (only their notes to write); v52: after the new recordings
+        except Daily as e:
+            log('⏸', e)
+    if rest_gate():
+        editions(cfg)  # v51: Russian editions for every message
+    if rest_gate():
+        redo(cfg)  # v39: the notes you already have, in the new format (no transcription needed: quick)
+    if rest_gate():
+        films(cfg)  # v49: the film library's descriptions: last, they matter least
     rounds = 0
-    while left_min() > 10 and rounds < 50:
+    while left_min() > 10 and rounds < 50 and rest_gate():
         rounds += 1
         try:  # v50 order: Кафедра first (Rutube audio, then any only on YouTube), then Горница, then the morning words
             if cfg.get('end'):  # faithBOT v40 or newer (it knows Rutube ids and the two preachers of one day)
@@ -1117,8 +1233,9 @@ def main():
         cfg = bot('turbo_cfg')
         if cfg.get('pause') or not (cfg.get('yt') and not YT_SPENT) or left_min() < 40:
             break
-    if left_min() > 20 and not cfg.get('pause') and not all(m in SPENT for m in WRITE_MODELS):
+    if left_min() > 20 and not cfg.get('pause') and not all(m in SPENT for m in WRITE_MODELS) and rest_gate():
         quiet(cfg)  # v41: time left in this run: missing transcripts, then the night study
+    quota_save()
     shutil.rmtree(TMP, ignore_errors=True)
 
 
