@@ -883,8 +883,9 @@ def due(within_h=24.0, sc=None):
             w = wd.get(day.weekday())
             if (not w or w['p'] < 0.5) and wd.get('any') and wd['any']['p'] >= 0.7:  # about weekly or more, on no fixed day: kept for every day
                 w = dict(wd['any'], p=min(1.0, wd['any']['p'] / 7))
-                if add == 0 and not seen_on(sc, kind, day.strftime('%Y-%m-%d')):
-                    out.append((kind, max(now, day.replace(hour=int(w['usual']), minute=int((w['usual'] % 1) * 60), second=0, microsecond=0)), w['p']))
+                at = max(now, day.replace(hour=int(w['usual']), minute=int((w['usual'] % 1) * 60), second=0, microsecond=0))
+                if add == 0 and not seen_on(sc, kind, day.strftime('%Y-%m-%d')) and (at - now).total_seconds() / 3600 <= within_h:
+                    out.append((kind, at, w['p']))
                 continue
             if not w or w['p'] < 0.5 or seen_on(sc, kind, day.strftime('%Y-%m-%d')):
                 continue
@@ -999,7 +1000,7 @@ def learn(cfg):
 
 def linger(cfg, have, max_min=35):
     """v57: a church message due in the next half hour: the run waits for it (a look every 5 minutes) and makes it at once."""
-    soon = [d for d in due(0.6) if d[1] > datetime.now(DUBAI) - timedelta(minutes=40)]
+    soon = [d for d in due(0.6) if d[2] >= 0.5 and d[1] > datetime.now(DUBAI) + timedelta(minutes=2)]  # v57: only a message that comes on a set day and time, still ahead
     if not soon or left_min() < max_min + 40:
         return
     kind, at, p = soon[0]
@@ -1506,7 +1507,7 @@ def main():
         have.update(cfg.get('have') or [])
         # v56: the helper's own memory counts only for older things: a recent church message is had only when faithBOT really has it
         church = ('kafedra|', 'gornitsa|', 'morning|')
-        have.update(k for k in memo().get('done', []) if OLD_BOT or not (k.startswith(church) and recent(k.split('|')[1])))  # v57: with an old faithBOT, nothing is re-made into its stopped queue
+        have.update(k for k in memo().get('done', []) if OLD_BOT or not (k.startswith(church) and recent(k.split('|')[1])) and not k.startswith('rt:'))  # v57: a Rutube id is had only when faithBOT has it (its list carries every one)  # v57: with an old faithBOT, nothing is re-made into its stopped queue
         try:
             run_pending(have, fresh_only=True)  # transcripts already made of the last days: their notes first
         except Daily as e:
