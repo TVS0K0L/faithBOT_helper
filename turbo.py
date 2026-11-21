@@ -293,7 +293,8 @@ def note_call():
 
 
 def rest_ok():
-    """True while the archive, the ministries and the rest may still use today's allowance (the reserve stays for the church's own)."""
+    """v56: the archive is closed: nothing to hold back for (the church's new messages always run first anyway)."""
+    return True
     cap, used = QUOTA.get('cap') or 0, QUOTA.get('used') or 0
     h = datetime.now(timezone.utc).hour
     if not cap or 6 <= h < 8:  # not learned yet, or the last two hours before it renews (the morning word is in by then)
@@ -362,8 +363,8 @@ def run_pending(have, fresh_only=False):
             age = 99999
         return (0 if is_fresh(m) else 1, age)
     items.sort(key=order)
-    if fresh_only:
-        items = [x for x in items if is_fresh(x[1].get('meta', {}))]
+    if fresh_only:  # v56: the church's last days first, then the ministries' (the archive's are left)
+        items = [x for x in items if is_fresh(x[1].get('meta', {})) or (x[1].get('meta', {}).get('kind') == 'youtube' and recent(x[1].get('meta', {}).get('date', ''), 30))]
     if items:
         log('pending: %d transcripts waiting for their notes%s' % (len(items), ' (the church\'s new ones)' if fresh_only else ''))
     for path, d in items:
@@ -439,6 +440,8 @@ def editions(cfg):
     for it in (cfg.get('med') or []):
         if left_min() < 25:
             return
+        if not recent(it.get('date', '')):  # v56: only the last ten days (the archive is closed)
+            continue
         try:
             src = bot('turbo_md', id=it['id']) or {}
             if not src.get('md') or not src.get('member'):
@@ -570,6 +573,8 @@ async def telegram(cfg, have, kinds=None, fresh_days=0):
                 if fresh_days and (time.time() - msg.date.timestamp()) > fresh_days * 86400:
                     break  # v51: the new recordings only (newest first)
                 text = msg.message or ''
+                if fresh_days and (msg.video or post_link(msg)) and need.search(text) and not skip.search(text) and not re.match(r'^\s*Начинаем', text):
+                    SEEN.append((src['kind'], details(text, msg.date)[1], msg.date.timestamp()))  # v56: the QA checks it reached the library
                 if fresh_days and (msg.video or post_link(msg)) and need.search(text) and not re.match(r'^\s*Начинаем', text):  # v52: names and forum posts of what the library already has
                     t_, d_, s_ = details(text, msg.date)
                     if '%s|%s' % (src['kind'], d_) in have:
@@ -756,7 +761,67 @@ def recent_date(d, days):
         return False
 
 
-FRESH_DAYS = 21  # v51: recordings this new are the church's new ones: done first, every hour, and sent to everyone
+FRESH_DAYS = 10  # v56: the last ten days (what was missed since 13.11 included); v51: recordings this new are the church's new ones: done first, every hour, and sent to everyone
+
+
+def recent(date, days=None):
+    """v56: within the last FRESH_DAYS days."""
+    try:
+        return (datetime.now() - datetime.strptime(date, '%d.%m.%Y')).days <= (days or FRESH_DAYS)
+    except Exception:
+        return False
+
+
+SEEN = []   # v56: the church's posts seen this run (kind, date): the QA checks each one reached the library
+QA = []     # v56: what the QA found this run
+
+
+def tick(where):
+    """v56: faithBOT's worker run by the helper (nothing waits on Google's triggers); the queue reported in the log."""
+    t = bot('turbo_tick', timeout=420)
+    if not t:
+        QA.append('⚠️ faithBOT did not answer the helper (%s)' % where)
+        return t
+    after = t.get('after') or []
+    log('⚙️ worker (%s): %d → %d jobs · triggers %s · minutes %s%s' % (where, t.get('before', 0), len(after), ','.join(sorted(set(t.get('triggers') or []))),
+        t.get('minutes'), (' · error ' + t['error']) if t.get('error') else ''))
+    for j in after[:12]:
+        log('    · %s %s %s «%s» tries %s %s' % (j.get('stage'), j.get('kind'), j.get('date'), j.get('t'), j.get('tries'), j.get('err', '')))
+    if t.get('error'):
+        QA.append('⚠️ the worker stopped with an error: %s' % t['error'][:120])
+    stuck = [j for j in after if j.get('stage') == 'failed' or (j.get('tries') or 0) >= 3]
+    if stuck:
+        QA.append('⚠️ %d job(s) not going through: %s' % (len(stuck), '; '.join('%s %s %s (%s)' % (j.get('kind'), j.get('date'), j.get('stage'), (j.get('err') or '')[:50]) for j in stuck[:4])))
+    trig = set(t.get('triggers') or [])
+    if 'morningPrayer' not in trig:
+        QA.append('⚠️ the hourly trigger is missing: run setup once')
+    mins = sum((t.get('minutes') or {}).values()) if isinstance(t.get('minutes'), dict) else 0
+    if mins > 70:
+        QA.append('⚠️ the bot\'s triggers used %d of Google\'s 90 daily minutes' % mins)
+    return t
+
+
+def qa_report(cfg):
+    """v56: the QA, on GitHub (no faithBOT minutes): every church post seen in the last days must be in the library; the ministries must move."""
+    try:
+        now = bot('turbo_cfg') or {}
+        have = set(now.get('have') or [])
+        for kind, date, posted in SEEN:
+            hrs = (time.time() - posted) / 3600 if posted else 99
+            if hrs < 6:
+                continue  # still within the normal processing time
+            if not any(h.startswith('%s|%s' % (kind, date)) for h in have):
+                QA.append('⚠️ %s %s is not in the library yet (posted %d h ago)' % ({'kafedra': 'Кафедра', 'gornitsa': 'Горница', 'morning': 'Утреннее слово'}.get(kind, kind), date, hrs))
+        old = [m for m in (now.get('ministries') or []) if m.get('pub') and time.time() - m['pub'] / 1000 > 3 * 86400]
+        if old:
+            QA.append('⚠️ %d ministry video(s) waiting more than 3 days (first: %s %s)' % (len(old), old[0].get('channel', ''), old[0].get('date', '')))
+    except Exception as e:
+        QA.append('⚠️ QA could not run: %s' % str(e)[:100])
+    if QA:
+        log('🩺 QA:\n  ' + '\n  '.join(QA))
+        bot('turbo_alert', lines=QA[:15])
+    else:
+        log('🩺 QA: all well')
 
 
 def fresh(cfg, have):
@@ -838,6 +903,12 @@ def rutube_kafedra(cfg, have, fresh_days=0):
         todo = [v for v in rutube_list() if 'rt:' + v['id'] not in have and not (v['dated'] and kkey(v['date'], v['speaker']) in have)]
         if fresh_days:  # v51: the new Кафедра only
             todo = [v for v in todo if v['dated'] and recent_date(v['date'], fresh_days)]
+            try:  # v56: the QA checks each new Кафедра reached the library (a day and a half after its date)
+                for v in rutube_list():
+                    if v['dated'] and recent_date(v['date'], fresh_days):
+                        SEEN.append(('kafedra', v['date'], datetime.strptime(v['date'], '%d.%m.%Y').timestamp() + 36 * 3600))
+            except Exception:
+                pass
     except Exception as e:
         log('Rutube: list failed:', str(e)[:120])
         return
@@ -1141,26 +1212,32 @@ def main():
     except Exception:
         pass
     cfg = bot('turbo_cfg')
-    if cfg.get('after') and cfg.get('daily'):  # v52: the archive is closed: every new recording and the ministries go on, then the quiet work
-        log('The archive is closed: new recordings, the ministries, Russian editions, then the quiet work.')
+    if cfg.get('transcribe') and not cfg.get('pause') or cfg.get('after'):  # v56: always daily mode now (the archive is closed, even before faithBOT v56 says so)
+        cfg['after'] = cfg['daily'] = True
+    if cfg.get('after') and cfg.get('daily'):  # v56: the archive is closed: the church's daily messages, then the ministries, nothing else
+        log('Daily mode: the church\'s new Кафедра, Горница and morning words (last %d days), then the ministries.' % FRESH_DAYS)
+        tick('start')  # anything already waiting in faithBOT's queue is finished first
+        cfg = bot('turbo_cfg') or cfg
         have = HAVE
         have.update(cfg.get('have') or [])
-        have.update(memo().get('done', []))
-        try:  # v55: the church's own new messages whose notes are still to write, first
-            run_pending(have, fresh_only=True)
+        # v56: the helper's own memory counts only for older things: a recent church message is had only when faithBOT really has it
+        church = ('kafedra|', 'gornitsa|', 'morning|')
+        have.update(k for k in memo().get('done', []) if not (k.startswith(church) and recent(k.split('|')[1])))
+        try:
+            run_pending(have, fresh_only=True)  # transcripts already made of the last days: their notes first
         except Daily as e:
             log('⏸', e)
-        if fresh(cfg, have):  # v55: the church's own new messages always first; the rest only outside the day's reserve
-            if rest_gate() and ministries(cfg, have):
-                try:
-                    run_pending(have)
-                except Daily as e:
-                    log('⏸', e)
-                if rest_gate():
-                    editions(cfg)
-            film_pics(cfg)  # v53 (no AI)
-            if left_min() > 20 and rest_gate():
-                quiet(cfg)
+        ok = fresh(cfg, have)
+        tick('after the church')
+        if ok and ministries(cfg, have):
+            try:
+                run_pending(have, fresh_only=True)
+            except Daily as e:
+                log('⏸', e)
+            editions(cfg)
+        film_pics(cfg)  # no AI
+        tick('end')
+        qa_report(cfg)
         quota_save()
         shutil.rmtree(TMP, ignore_errors=True)
         return
