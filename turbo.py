@@ -604,6 +604,7 @@ async def telegram(cfg, have, kinds=None, fresh_days=0):
                     if not path:
                         continue
                     log('📝', src['kind'], date, title[:60])
+                    item_start(src['kind'])  # v57: what it costs
                     tr, total = transcribe_audio(path, cfg['transcribe'])
                     os.remove(path)
                     if len(tr) < 200:
@@ -611,6 +612,7 @@ async def telegram(cfg, have, kinds=None, fresh_days=0):
                         continue
                     res = notes({'kind': src['kind'], 'title': title, 'date': date, 'speaker': sp}, tr, total)
                     log('  ✅' if res.get('ok') else '  · %s' % str(res)[:100])
+                    item_end(bool(res.get('ok')), total)
                     have.add('%s|%s' % (src['kind'], date))
                 except Daily as e:
                     log('⏸', e)
@@ -714,6 +716,10 @@ def ministries(cfg, have):
             return True
         if 'yt:' + v['id'] in have:
             continue
+        if not church_again(cfg, have):  # v57: the church's new messages first, also in the middle of the ministries
+            return False
+        if not ministry_ok():  # v57: today's church messages still to come keep their share of the allowance
+            return True
         meta = yt_meta(v['id'])  # v54: the real length first (the bot can't see it)
         if meta.get('live') in ('is_live', 'is_upcoming'):
             continue  # still live or not started: the next run
@@ -722,6 +728,8 @@ def ministries(cfg, have):
             bot('turbo_ytfail', id=v['id'], why='stream or short', drop=1)
             continue
         log('📝 %s %s «%s»' % (v.get('channel', ''), v.get('date', ''), (v.get('title') or '')[:60]))
+        item_start('youtube')
+        total = 0
         try:
             mp3 = yt_audio(v['id'])
             if mp3:
@@ -740,6 +748,7 @@ def ministries(cfg, have):
                 continue
             res = notes({'kind': 'youtube', 'title': v.get('title', ''), 'date': v.get('date', ''), 'speaker': v.get('speaker', ''), 'channel': v.get('channel', ''), 'yt': v['id']}, tr, total)
             log('  ✅' if res.get('ok') else '  · %s' % str(res)[:100])
+            item_end(bool(res.get('ok')), total)
             have.add('yt:' + v['id'])
         except Daily as e:
             log('⏸ Gemini\'s free daily limit: the ministries go on in the next run', e)
@@ -776,9 +785,265 @@ SEEN = []   # v56: the church's posts seen this run (kind, date): the QA checks 
 QA = []     # v56: what the QA found this run
 
 
+# ---------------------------------------------------------------------- v57: the church's timetable, learned; the minutes, counted
+# The Кафедра, Горница and morning word are what people depend on: they get the allowance first, every day. The helper learns
+# from every post it sees when each one comes out (weekday and time in Dubai; for the Кафедра, when it appears on Rutube),
+# counts what each one costs (Gemini calls, minutes of the run, minutes of audio), keeps back what today's still-to-come
+# church messages will need, and only then lets the YouTube ministries use the rest. A post is looked for again between
+# ministry videos, and when one is due in the next half hour the run waits for it instead of ending.
+CHURCH = ('kafedra', 'gornitsa', 'morning')
+NAMES = {'kafedra': 'Кафедра', 'gornitsa': 'Горница', 'morning': 'Утреннее слово', 'youtube': 'ministries'}
+DUBAI = timezone(timedelta(hours=4))
+COST0 = {'morning': 4, 'gornitsa': 6, 'kafedra': 8, 'youtube': 7}  # Gemini calls per item until learned
+OLD_BOT = []  # faithBOT without the v56 worker run: re-made church messages would wait in a stopped queue
+ITEM = {}
+LAST_SCAN = [0.0]
+
+
+def pub_ts(v):
+    try:
+        return datetime.fromisoformat(str(v.get('pub') or '').replace('Z', '+00:00')).replace(tzinfo=timezone.utc).timestamp() if v.get('pub') else 0
+    except Exception:
+        return 0
+
+
+def sched_get(m=None):
+    m = m or memo()
+    sc = m.get('sched') or {}
+    sc.setdefault('ev', {})
+    sc.setdefault('cost', {})
+    sc.setdefault('ledger', {})
+    return sc
+
+
+def sched_put(fn):
+    m = memo()
+    sc = sched_get(m)
+    fn(sc)
+    m['sched'] = sc
+    memo_save(m)
+
+
+def learn_seen():
+    """Every church post seen (its sermon date and real publication time) into the timetable."""
+    def put(sc):
+        for kind, date, ts in SEEN:
+            if kind in CHURCH and ts and ts < time.time() + 3600:
+                ev = sc['ev'].setdefault(kind, {})
+                ev.setdefault(date, ts)  # the first time it was seen is when it came out
+        for kind in sc['ev']:
+            keep = sorted(sc['ev'][kind].items(), key=lambda x: -x[1])[:80]  # about three months
+            sc['ev'][kind] = dict(keep)
+    sched_put(put)
+
+
+def timetable(sc=None):
+    """Per church kind: the weekdays it comes out on (share of weeks), and the usual and latest time that day (Dubai)."""
+    sc = sc or sched_get()
+    out = {}
+    for kind in CHURCH:
+        ts = sorted((sc['ev'].get(kind) or {}).values())
+        if len(ts) < 3:
+            continue
+        span_weeks = max(1.0, (time.time() - ts[0]) / (7 * 86400))
+        days = {}
+        for t in ts:
+            d = datetime.fromtimestamp(t, DUBAI)
+            days.setdefault(d.weekday(), {})[d.strftime('%Y-%m-%d')] = d.hour + d.minute / 60
+        wd = {}
+        for w, per in days.items():
+            hrs = sorted(per.values())
+            wd[w] = {'p': round(min(1.0, len(per) / span_weeks), 2), 'usual': hrs[len(hrs) // 2], 'late': hrs[min(len(hrs) - 1, int(len(hrs) * 0.85))], 'n': len(per)}
+        out[kind] = wd
+    return out
+
+
+def hm(h):
+    return '%02d:%02d' % (int(h), int(round((h % 1) * 60)) % 60)
+
+
+def seen_on(sc, kind, day):
+    return any(datetime.fromtimestamp(t, DUBAI).strftime('%Y-%m-%d') == day for t in (sc['ev'].get(kind) or {}).values())
+
+
+def due(within_h=24.0, sc=None):
+    """The church messages still to come in the next hours (not seen yet that day): (kind, when, chance)."""
+    sc = sc or sched_get()
+    tt = timetable(sc)
+    now = datetime.now(DUBAI)
+    out = []
+    for kind, wd in tt.items():
+        for add in (0, 1):
+            day = now + timedelta(days=add)
+            w = wd.get(day.weekday())
+            if not w or w['p'] < 0.5 or seen_on(sc, kind, day.strftime('%Y-%m-%d')):
+                continue
+            at = day.replace(hour=int(w['usual']), minute=int((w['usual'] % 1) * 60), second=0, microsecond=0)
+            late = day.replace(hour=int(w['late']), minute=int((w['late'] % 1) * 60), second=0, microsecond=0)
+            if late < now - timedelta(hours=3):
+                continue  # not come today (the QA says so once)
+            if (at - now).total_seconds() / 3600 <= within_h:
+                out.append((kind, at, w['p']))
+    return sorted(out, key=lambda x: x[1])
+
+
+def cost(kind, sc=None):
+    sc = sc or sched_get()
+    c = sc['cost'].get(kind) or {}
+    return c.get('calls') or COST0.get(kind, 6)
+
+
+def item_start(kind):
+    ITEM.clear()
+    ITEM.update({'kind': kind, 't0': time.time(), 'calls0': QUOTA.get('used', 0)})
+
+
+def item_end(ok, audio_sec=0):
+    """What one message cost: kept as a running average per kind, and in today's ledger."""
+    if not ITEM:
+        return
+    kind, calls, mins = ITEM['kind'], max(0, QUOTA.get('used', 0) - ITEM['calls0']), (time.time() - ITEM['t0']) / 60
+    ITEM.clear()
+    def put(sc):
+        if ok and calls:
+            c = sc['cost'].setdefault(kind, {})
+            for k, v in (('calls', calls), ('min', mins), ('audio', audio_sec / 60)):
+                c[k] = round(v if not c.get(k) else c[k] * 0.7 + v * 0.3, 1)
+            c['n'] = c.get('n', 0) + 1
+        day = datetime.now(DUBAI).strftime('%Y-%m-%d')
+        L = sc['ledger'].setdefault(day, {}).setdefault(kind, {'n': 0, 'fail': 0, 'calls': 0, 'min': 0, 'audio': 0})
+        L['n' if ok else 'fail'] += 1
+        L['calls'] += calls
+        L['min'] = round(L['min'] + mins, 1)
+        L['audio'] = round(L['audio'] + audio_sec / 60, 1)
+        for d in sorted(sc['ledger'])[:-14]:
+            del sc['ledger'][d]
+    sched_put(put)
+
+
+def reserve_calls(sc=None):
+    """The Gemini calls kept for the church messages still to come before the allowance renews (12:00 Dubai)."""
+    sc = sc or sched_get()
+    now = datetime.now(DUBAI)
+    renew = now.replace(hour=12, minute=0, second=0, microsecond=0)
+    if renew <= now:
+        renew += timedelta(days=1)
+    hrs = (renew - now).total_seconds() / 3600
+    return int(round(sum(cost(k, sc) * 1.3 for k, at, p in due(hrs, sc))))
+
+
+def ministry_ok():
+    """v57: a ministry video only with the church's share kept back: the allowance learned, minus what is used, minus the reserve."""
+    sc = sched_get()
+    cap, used = QUOTA.get('cap') or 0, QUOTA.get('used') or 0
+    if not cap or cap < 20:
+        return True  # not learned yet: the church is checked again before every video anyway
+    need = reserve_calls(sc)
+    if used + need + cost('youtube', sc) <= cap:
+        return True
+    if 'held' not in ITEM:
+        log('⏸ the ministries wait: %d of about %d Gemini calls used, %d kept for %s' % (used, cap, need, ', '.join(sorted(set(NAMES[k] for k, a, p in due(24, sc)))) or 'the church'))
+    return False
+
+
+def church_again(cfg, have, every_min=20):
+    """v57: between ministry videos: anything new from the church goes first."""
+    if time.time() - LAST_SCAN[0] < every_min * 60:
+        return True
+    return fresh(cfg, have)
+
+
+async def learn_history(cfg, days=63):
+    """Once a week (or until enough is known): when the Горница and morning words came out, from the channel's history (no downloads)."""
+    from telethon import TelegramClient
+    from telethon.sessions import StringSession
+    async with TelegramClient(StringSession(os.environ['TG_SESSION']), int(os.environ['TG_API_ID']), os.environ['TG_API_HASH']) as client:
+        await client.get_dialogs()
+        for src in [x for x in cfg['sources'] if x['kind'] in CHURCH]:
+            ch = str(src['ch'])
+            entity = await client.get_entity(int(ch) if re.match(r'^-?\d+$', ch) else ch)
+            need, skip = re.compile(src['need'], re.I), re.compile(r'форум|^\s*Начинаем|zoom\.us', re.I)
+            async for msg in client.iter_messages(entity, reply_to=src.get('topic') or None):
+                if time.time() - msg.date.timestamp() > days * 86400:
+                    break
+                text = msg.message or ''
+                if (msg.video or post_link(msg)) and need.search(text) and not skip.search(text):
+                    SEEN.append((src['kind'], details(text, msg.date)[1], msg.date.timestamp()))
+    for v in rutube_list():
+        if pub_ts(v) > time.time() - days * 86400:
+            SEEN.append(('kafedra', v['date'], pub_ts(v)))
+
+
+def learn(cfg):
+    sc = sched_get()
+    few = any(len(sc['ev'].get(k) or {}) < 6 for k in CHURCH)
+    if few or time.time() - (sc.get('learned') or 0) > 7 * 86400:
+        try:
+            asyncio.run(learn_history(cfg))
+            sched_put(lambda s: s.update(learned=time.time()))
+            log('📅 timetable learned from the last 9 weeks')
+        except Exception as e:
+            log('📅 timetable: history not read (%s)' % str(e)[:100])
+    learn_seen()
+
+
+def linger(cfg, have, max_min=35):
+    """v57: a church message due in the next half hour: the run waits for it (a look every 5 minutes) and makes it at once."""
+    soon = [d for d in due(0.6) if d[1] > datetime.now(DUBAI) - timedelta(minutes=40)]
+    if not soon or left_min() < max_min + 40:
+        return
+    kind, at, p = soon[0]
+    log('⏳ %s usually comes out about %s: waiting for it' % (NAMES[kind], at.strftime('%H:%M')))
+    t0 = time.time()
+    while time.time() - t0 < max_min * 60:
+        time.sleep(300)
+        n = len(SEEN)
+        fresh(cfg, have)
+        learn_seen()
+        if not [d for d in due(0.6) if d[0] == kind]:
+            log('  · %s is in' % NAMES[kind])
+            return
+        del SEEN[n:]
+
+
+def sched_report():
+    """The timetable and today's minutes to faithBOT (for /status), and to the log."""
+    sc = sched_get()
+    tt = timetable(sc)
+    wdn = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+    lines = []
+    for kind in CHURCH:
+        wd = tt.get(kind) or {}
+        days = [(w, x) for w, x in sorted(wd.items()) if x['p'] >= 0.5]
+        if days:
+            lines.append('%s: %s' % (NAMES[kind], ', '.join('%s ~%s' % (wdn[w], hm(x['usual'])) for w, x in days)))
+        else:
+            lines.append('%s: still learning (%d seen)' % (NAMES[kind], len(sc['ev'].get(kind) or {})))
+    day = datetime.now(DUBAI).strftime('%Y-%m-%d')
+    L = sc['ledger'].get(day) or {}
+    spent = ['%s %d (%d calls, %.0f min)' % (NAMES.get(k, k), v['n'], v['calls'], v['min']) for k, v in L.items()]
+    up = ['%s ~%s' % (NAMES[k], at.strftime('%a %H:%M')) for k, at, p in due(24, sc)]
+    for l in lines:
+        log('📅 ' + l)
+    log('⏱ today: %s · Gemini %d of about %s · kept for the church: %d' % ('; '.join(spent) or 'nothing yet', QUOTA.get('used', 0), QUOTA.get('cap') or '?', reserve_calls(sc)))
+    bot('turbo_sched', table=lines, today=L, used=QUOTA.get('used', 0), cap=QUOTA.get('cap') or 0, reserve=reserve_calls(sc), next=up[:4],
+        cost={k: v for k, v in sc['cost'].items()}, week={d: sc['ledger'][d] for d in sorted(sc['ledger'])[-7:]})
+    # the QA: a message that always comes on this weekday and is now well past its latest time
+    now = datetime.now(DUBAI)
+    for kind, wd in tt.items():
+        w = wd.get(now.weekday())
+        if w and w['p'] >= 0.8 and w['n'] >= 3 and now.hour + now.minute / 60 > w['late'] + 4 and not seen_on(sc, kind, now.strftime('%Y-%m-%d')):
+            QA.append('ℹ️ %s has not been posted today (it usually is by %s): nothing to make yet' % (NAMES[kind], hm(w['late'])))
+
+
 def tick(where):
     """v56: faithBOT's worker run by the helper (nothing waits on Google's triggers); the queue reported in the log."""
     t = bot('turbo_tick', timeout=420)
+    if t.get('error') == 'unknown':  # v57: faithBOT older than v56: its queue only moves on Google's triggers
+        if not OLD_BOT:
+            OLD_BOT.append(1)
+            QA.append('⚠️ faithBOT is still the old version: its queue does not move. Install the newest Code.gs and run setup once.')
+        return {}
     if not t:
         QA.append('⚠️ faithBOT did not answer the helper (%s)' % where)
         return t
@@ -826,6 +1091,7 @@ def qa_report(cfg):
 
 def fresh(cfg, have):
     """v51: the newest Кафедра, Горница and morning words first, before any archive work."""
+    LAST_SCAN[0] = time.time()  # v57
     try:
         if cfg.get('end'):
             rutube_kafedra(cfg, have, FRESH_DAYS)
@@ -873,7 +1139,7 @@ def rutube_list():
             title = re.split(r'\s+\d{1,2}\.\d{1,2}\.\d{2,4}|\s+//', title)[0].strip(' |«»"-').strip()
             title = title[:1].upper() + title[1:].lower() if title.isupper() else title
             out.append({'id': v['id'], 'title': title or t[:80], 'date': date or datetime.fromisoformat(v['created_ts']).strftime('%d.%m.%Y'), 'dated': bool(date),
-                        'len': v.get('duration') or 0, 'speaker': 'Пастор Ольга Матюжова' if 'ОЛЬГА' in up else 'Епископ Андрей Матюжов'})
+                        'len': v.get('duration') or 0, 'pub': v.get('publication_ts') or v.get('created_ts') or '', 'speaker': 'Пастор Ольга Матюжова' if 'ОЛЬГА' in up else 'Епископ Андрей Матюжов'})
         if not r.get('has_next'):
             break
         page += 1
@@ -902,11 +1168,11 @@ def rutube_kafedra(cfg, have, fresh_days=0):
     try:
         todo = [v for v in rutube_list() if 'rt:' + v['id'] not in have and not (v['dated'] and kkey(v['date'], v['speaker']) in have)]
         if fresh_days:  # v51: the new Кафедра only
-            todo = [v for v in todo if v['dated'] and recent_date(v['date'], fresh_days)]
-            try:  # v56: the QA checks each new Кафедра reached the library (a day and a half after its date)
+            todo = [v for v in todo if recent_date(v['date'], fresh_days) or (not v['dated'] and pub_ts(v) > time.time() - fresh_days * 86400)]  # v57: an undated new Кафедра too (its upload day)
+            try:  # v56: the QA checks each new Кафедра reached the library; v57: from its real publication time (the learner too)
                 for v in rutube_list():
-                    if v['dated'] and recent_date(v['date'], fresh_days):
-                        SEEN.append(('kafedra', v['date'], datetime.strptime(v['date'], '%d.%m.%Y').timestamp() + 36 * 3600))
+                    if recent_date(v['date'], fresh_days) or pub_ts(v) > time.time() - fresh_days * 86400:
+                        SEEN.append(('kafedra', v['date'], pub_ts(v) or datetime.strptime(v['date'], '%d.%m.%Y').timestamp() + 36 * 3600))
             except Exception:
                 pass
     except Exception as e:
@@ -923,6 +1189,7 @@ def rutube_kafedra(cfg, have, fresh_days=0):
             mp3 = rutube_audio(v['id'])
             if not mp3:
                 continue
+            item_start('kafedra')  # v57
             tr, total = transcribe_audio(mp3, cfg['transcribe'])
             os.remove(mp3)
             if len(tr) < 200:
@@ -930,6 +1197,7 @@ def rutube_kafedra(cfg, have, fresh_days=0):
                 continue
             res = notes({'kind': 'kafedra', 'title': v['title'], 'date': v['date'], 'speaker': v['speaker'], 'rt': v['id']}, tr, total)
             log('  ✅' if res.get('ok') else '  · %s' % str(res)[:100])
+            item_end(bool(res.get('ok')), total)
             have.add('rt:' + v['id'])
             if v['dated']:
                 have.add(kkey(v['date'], v['speaker']))
@@ -1222,13 +1490,17 @@ def main():
         have.update(cfg.get('have') or [])
         # v56: the helper's own memory counts only for older things: a recent church message is had only when faithBOT really has it
         church = ('kafedra|', 'gornitsa|', 'morning|')
-        have.update(k for k in memo().get('done', []) if not (k.startswith(church) and recent(k.split('|')[1])))
+        have.update(k for k in memo().get('done', []) if OLD_BOT or not (k.startswith(church) and recent(k.split('|')[1])))  # v57: with an old faithBOT, nothing is re-made into its stopped queue
         try:
             run_pending(have, fresh_only=True)  # transcripts already made of the last days: their notes first
         except Daily as e:
             log('⏸', e)
         ok = fresh(cfg, have)
+        learn(cfg)  # v57: when each church message comes out, from what was just seen (and the channels' history once a week)
         tick('after the church')
+        if OLD_BOT:
+            log('⏸ faithBOT is the old version: nothing more is made until the newest Code.gs is installed (its queue does not move)')
+            ok = False
         if ok and ministries(cfg, have):
             try:
                 run_pending(have, fresh_only=True)
@@ -1236,7 +1508,11 @@ def main():
                 log('⏸', e)
             editions(cfg)
         film_pics(cfg)  # no AI
+        if ok:
+            linger(cfg, have)  # v57: one due in the next half hour: waited for and made at once
+        learn_seen()
         tick('end')
+        sched_report()
         qa_report(cfg)
         quota_save()
         shutil.rmtree(TMP, ignore_errors=True)
