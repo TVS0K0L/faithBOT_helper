@@ -1083,7 +1083,11 @@ def qa_report(cfg):
     try:
         now = bot('turbo_cfg') or {}
         have = set(now.get('have') or [])
-        for kind, date, posted in SEEN:
+        told = set()
+        for kind, date, posted in sorted(SEEN, key=lambda x: x[2] or 0):
+            if (kind, date) in told:
+                continue  # one line per message (a day with two posts, or seen twice)
+            told.add((kind, date))
             hrs = (time.time() - posted) / 3600 if posted else 99
             if hrs < 6:
                 continue  # still within the normal processing time
