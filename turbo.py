@@ -854,6 +854,11 @@ def timetable(sc=None):
         for w, per in days.items():
             hrs = sorted(per.values())
             wd[w] = {'p': round(min(1.0, len(per) / span_weeks), 2), 'usual': hrs[len(hrs) // 2], 'late': hrs[min(len(hrs) - 1, int(len(hrs) * 0.85))], 'n': len(per)}
+        covered = sum(x['n'] for x in wd.values() if x['p'] >= 0.5) / float(sum(x['n'] for x in wd.values()))
+        if covered < 0.7:  # no fixed weekday (the Кафедра on Rutube, often the Горница): any day, at its usual hour
+            allh = sorted(d.hour + d.minute / 60 for d in (datetime.fromtimestamp(t, DUBAI) for t in ts))
+            wd['any'] = {'p': round(len(set(datetime.fromtimestamp(t, DUBAI).strftime('%Y-%m-%d') for t in ts)) / span_weeks, 2),
+                         'usual': allh[len(allh) // 2], 'late': allh[-1], 'n': len(ts)}
         out[kind] = wd
     return out
 
@@ -876,6 +881,11 @@ def due(within_h=24.0, sc=None):
         for add in (0, 1):
             day = now + timedelta(days=add)
             w = wd.get(day.weekday())
+            if (not w or w['p'] < 0.5) and wd.get('any') and wd['any']['p'] >= 0.7:  # about weekly or more, on no fixed day: kept for every day
+                w = dict(wd['any'], p=min(1.0, wd['any']['p'] / 7))
+                if add == 0 and not seen_on(sc, kind, day.strftime('%Y-%m-%d')):
+                    out.append((kind, max(now, day.replace(hour=int(w['usual']), minute=int((w['usual'] % 1) * 60), second=0, microsecond=0)), w['p']))
+                continue
             if not w or w['p'] < 0.5 or seen_on(sc, kind, day.strftime('%Y-%m-%d')):
                 continue
             at = day.replace(hour=int(w['usual']), minute=int((w['usual'] % 1) * 60), second=0, microsecond=0)
@@ -1014,8 +1024,10 @@ def sched_report():
     lines = []
     for kind in CHURCH:
         wd = tt.get(kind) or {}
-        days = [(w, x) for w, x in sorted(wd.items()) if x['p'] >= 0.5]
-        if days:
+        days = [(w, x) for w, x in sorted((k, v) for k, v in wd.items() if k != 'any') if x['p'] >= 0.5]
+        if wd.get('any'):
+            lines.append('%s: any day, about %.1f a week, usually ~%s · its share is kept every day' % (NAMES[kind], wd['any']['p'], hm(wd['any']['usual'])))
+        elif days:
             lines.append('%s: %s' % (NAMES[kind], ', '.join('%s ~%s' % (wdn[w], hm(x['usual'])) for w, x in days)))
         else:
             lines.append('%s: still learning (%d seen)' % (NAMES[kind], len(sc['ev'].get(kind) or {})))
@@ -1032,7 +1044,7 @@ def sched_report():
     now = datetime.now(DUBAI)
     for kind, wd in tt.items():
         w = wd.get(now.weekday())
-        if w and w['p'] >= 0.8 and w['n'] >= 3 and now.hour + now.minute / 60 > w['late'] + 4 and not seen_on(sc, kind, now.strftime('%Y-%m-%d')):
+        if w and 'any' not in wd and w['p'] >= 0.8 and w['n'] >= 3 and now.hour + now.minute / 60 > w['late'] + 4 and not seen_on(sc, kind, now.strftime('%Y-%m-%d')):
             QA.append('ℹ️ %s has not been posted today (it usually is by %s): nothing to make yet' % (NAMES[kind], hm(w['late'])))
 
 
@@ -1168,7 +1180,7 @@ def rutube_kafedra(cfg, have, fresh_days=0):
     try:
         todo = [v for v in rutube_list() if 'rt:' + v['id'] not in have and not (v['dated'] and kkey(v['date'], v['speaker']) in have)]
         if fresh_days:  # v51: the new Кафедра only
-            todo = [v for v in todo if recent_date(v['date'], fresh_days) or (not v['dated'] and pub_ts(v) > time.time() - fresh_days * 86400)]  # v57: an undated new Кафедра too (its upload day)
+            todo = [v for v in todo if recent_date(v['date'], fresh_days) or pub_ts(v) > time.time() - fresh_days * 86400]  # v57: by when it came out on Rutube too (a late upload, or no date in its title)
             try:  # v56: the QA checks each new Кафедра reached the library; v57: from its real publication time (the learner too)
                 for v in rutube_list():
                     if recent_date(v['date'], fresh_days) or pub_ts(v) > time.time() - fresh_days * 86400:
