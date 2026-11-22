@@ -570,8 +570,8 @@ async def telegram(cfg, have, kinds=None, fresh_days=0):
             if not fresh_days:
                 kw['offset_date'] = before
             async for msg in client.iter_messages(entity, **kw):
-                if fresh_days and (time.time() - msg.date.timestamp()) > fresh_days * 86400:
-                    break  # v51: the new recordings only (newest first)
+                if fresh_days and (time.time() - msg.date.timestamp()) > max(fresh_days, carry_days()) * 86400:
+                    break  # v51: the new recordings only (newest first); v57: as far back as a carried-over one
                 text = msg.message or ''
                 if fresh_days and (msg.video or post_link(msg)) and need.search(text) and not skip.search(text) and not re.match(r'^\s*Начинаем', text):
                     SEEN.append((src['kind'], details(text, msg.date)[1], msg.date.timestamp()))  # v56: the QA checks it reached the library
@@ -593,6 +593,7 @@ async def telegram(cfg, have, kinds=None, fresh_days=0):
             if not fresh_days:
                 bot('turbo_totals', totals={src['kind']: len(todo)})
             log('%s: %d %s' % (src['kind'], len(todo), 'new (last %d days)' % fresh_days if fresh_days else 'in the archive'))
+            todo.sort(key=lambda m: carry_first('%s|%s' % (src['kind'], details(m.message or '', m.date)[1])))  # v57: the carried-over first
             for msg in todo:  # newest first
                 if left_min() < 10 or (not fresh_days and not rest_gate()):  # v55: the archive stops at the day's reserve
                     return
@@ -616,9 +617,11 @@ async def telegram(cfg, have, kinds=None, fresh_days=0):
                     have.add('%s|%s' % (src['kind'], date))
                 except Daily as e:
                     log('⏸', e)
+                    FAIL[0] = 'Gemini\'s daily limit'
                     return
                 except Exception as e:
                     log('  ⚠️', str(e)[:160])
+                    FAIL[0] = 'error: ' + str(e)[:60]
 
 
 async def fetch_post(client, msg):
@@ -940,7 +943,10 @@ def reserve_calls(sc=None):
     if renew <= now:
         renew += timedelta(days=1)
     hrs = (renew - now).total_seconds() / 3600
-    return int(round(sum(cost(k, sc) * 1.3 for k, at, p in due(hrs, sc))))
+    def margin(k):  # v57: a kind that missed for the daily limit in the last two weeks keeps a larger share
+        c = sc['cost'].get(k) or {}
+        return 1.3 + (min(3, c.get('qfail', 0)) * .25 if time.time() - c.get('qat', 0) < 14 * 86400 else 0)
+    return int(round(sum(cost(k, sc) * margin(k) for k, at, p in due(hrs, sc))))
 
 
 def ministry_ok():
@@ -1034,12 +1040,14 @@ def sched_report():
             lines.append('%s: still learning (%d seen)' % (NAMES[kind], len(sc['ev'].get(kind) or {})))
     day = datetime.now(DUBAI).strftime('%Y-%m-%d')
     L = sc['ledger'].get(day) or {}
-    spent = ['%s %d (%d calls, %.0f min)' % (NAMES.get(k, k), v['n'], v['calls'], v['min']) for k, v in L.items()]
+    spent = ['%s %d (%d calls, %.0f min)' % (NAMES.get(k, k), v['n'], v['calls'], v['min']) for k, v in L.items() if isinstance(v, dict)]
+    if L.get('recovered'):
+        spent.append('recovered: ' + '; '.join(L['recovered']))
     up = ['%s ~%s' % (NAMES[k], at.strftime('%a %H:%M')) for k, at, p in due(24, sc)]
     for l in lines:
         log('📅 ' + l)
     log('⏱ today: %s · Gemini %d of about %s · kept for the church: %d' % ('; '.join(spent) or 'nothing yet', QUOTA.get('used', 0), QUOTA.get('cap') or '?', reserve_calls(sc)))
-    bot('turbo_sched', table=lines, today=L, used=QUOTA.get('used', 0), cap=QUOTA.get('cap') or 0, reserve=reserve_calls(sc), next=up[:4],
+    bot('turbo_sched', carry=['%s %s · %s · %d run(s)' % (k.split('|')[0], k.split('|')[1], v.get('why', ''), v.get('runs', 0)) for k, v in CARRY.items()], table=lines, today=L, used=QUOTA.get('used', 0), cap=QUOTA.get('cap') or 0, reserve=reserve_calls(sc), next=up[:4],
         cost={k: v for k, v in sc['cost'].items()}, week={d: sc['ledger'][d] for d in sorted(sc['ledger'])[-7:]})
     # the QA: a message that always comes on this weekday and is now well past its latest time
     now = datetime.now(DUBAI)
@@ -1084,26 +1092,89 @@ def qa_report(cfg):
     try:
         now = bot('turbo_cfg') or {}
         have = set(now.get('have') or [])
-        told = set()
-        for kind, date, posted in sorted(SEEN, key=lambda x: x[2] or 0):
-            if (kind, date) in told:
-                continue  # one line per message (a day with two posts, or seen twice)
-            told.add((kind, date))
-            hrs = (time.time() - posted) / 3600 if posted else 99
-            if hrs < 6:
-                continue  # still within the normal processing time
-            if not any(h.startswith('%s|%s' % (kind, date)) for h in have):
-                QA.append('⚠️ %s %s is not in the library yet (posted %d h ago)' % ({'kafedra': 'Кафедра', 'gornitsa': 'Горница', 'morning': 'Утреннее слово'}.get(kind, kind), date, hrs))
+        carry_update(have)  # v57: what is missing is carried over (first in the next run), what arrived is logged
         old = [m for m in (now.get('ministries') or []) if m.get('pub') and time.time() - m['pub'] / 1000 > 3 * 86400]
         if old:
             QA.append('⚠️ %d ministry video(s) waiting more than 3 days (first: %s %s)' % (len(old), old[0].get('channel', ''), old[0].get('date', '')))
     except Exception as e:
         QA.append('⚠️ QA could not run: %s' % str(e)[:100])
+    QA[:] = list(dict.fromkeys(QA))  # v57: each finding once (the worker is looked at three times a run)
     if QA:
         log('🩺 QA:\n  ' + '\n  '.join(QA))
         bot('turbo_alert', lines=QA[:15])
     else:
         log('🩺 QA: all well')
+
+
+# ---------------------------------------------------------------------- v57: the carry-over rule
+# A Кафедра, Горница or morning word seen but not in the library after a run is carried over: logged with why (Gemini's daily
+# limit, an error, stuck in faithBOT) and how many runs it has waited. Every next run (the next day too) makes the carried ones
+# first, oldest first, then the day's new ones, then the ministries; a recovered one is logged with how late it came. A kind that
+# missed for the daily limit has its share of the allowance kept larger from then on (it learns how much the church really needs).
+CARRY = {}
+FAIL = ['']  # why this run could not make one (the last reason seen)
+
+
+def carry_load():
+    CARRY.clear()
+    CARRY.update(memo().get('carry') or {})
+
+
+def carry_save():
+    m = memo()
+    m['carry'] = CARRY
+    memo_save(m)
+
+
+def carry_days():
+    """How far back the church is looked at: the usual ten days, or as far as the oldest carried message (21 at most)."""
+    old = [datetime.strptime(k.split('|')[1], '%d.%m.%Y') for k in CARRY if re.match(r'^\w+\|\d\d\.\d\d\.\d{4}', k)]
+    return min(21, max([FRESH_DAYS] + [(datetime.now() - d).days + 2 for d in old]))
+
+
+def carry_first(key):
+    """Sort key: carried messages first (oldest first), then the rest in their own order."""
+    c = CARRY.get(key)
+    return (0, c.get('since', 0)) if c else (1, 0)
+
+
+def carry_update(have):
+    """After the run: what is still missing is carried (why, since when, how many runs); what arrived is logged as recovered."""
+    names = {'kafedra': 'Кафедра', 'gornitsa': 'Горница', 'morning': 'Утреннее слово'}
+    missing, told = [], set()
+    for kind, date, posted in sorted(SEEN, key=lambda x: x[2] or 0):
+        if (kind, date) in told or not posted or (time.time() - posted) / 3600 < 6:
+            continue
+        told.add((kind, date))
+        if not any(h.startswith('%s|%s' % (kind, date)) for h in have):
+            missing.append((kind, date, posted))
+    now_keys = set('%s|%s' % (k, d) for k, d, _ in missing)
+    day = datetime.now(DUBAI).strftime('%Y-%m-%d')
+    rec = []
+    for key in list(CARRY):
+        if key not in now_keys and any(h.startswith(key) for h in have):
+            c = CARRY.pop(key)
+            rec.append('%s %s (%d runs late, %s)' % (names.get(key.split('|')[0], key), key.split('|')[1], c.get('runs', 0), c.get('why', '')))
+    for kind, date, posted in missing:
+        key = '%s|%s' % (kind, date)
+        c = CARRY.setdefault(key, {'since': time.time(), 'runs': 0, 'why': ''})
+        c['runs'] += 1
+        c['why'] = FAIL[0] or c.get('why') or 'not made yet'
+        c['posted'] = posted
+        if 'Gemini' in c['why'] or 'limit' in c['why']:
+            sched_put(lambda sc, k=kind: sc['cost'].setdefault(k, {}).update(qfail=sc['cost'].get(k, {}).get('qfail', 0) + 1, qat=time.time()))
+    for key in list(CARRY):  # older than three weeks: given up on, and said so
+        if time.time() - CARRY[key].get('since', time.time()) > 21 * 86400:
+            QA.append('⚠️ %s %s could not be made in three weeks (%s): please look at it' % (names.get(key.split('|')[0], key), key.split('|')[1], CARRY[key].get('why', '')))
+            del CARRY[key]
+    carry_save()
+    if rec:
+        log('✅ recovered: ' + '; '.join(rec))
+        sched_put(lambda sc: sc['ledger'].setdefault(day, {}).setdefault('recovered', []).extend(rec))
+    for kind, date, posted in missing:
+        c = CARRY['%s|%s' % (kind, date)]
+        QA.append('⚠️ %s %s not in the library yet (posted %d h ago) · carried over: first in the next run · %s · %d run(s)' % (names.get(kind, kind), date, (time.time() - posted) / 3600, c['why'], c['runs']))
+    return missing
 
 
 def fresh(cfg, have):
@@ -1115,6 +1186,7 @@ def fresh(cfg, have):
         asyncio.run(telegram(cfg, have, ['gornitsa', 'morning'], FRESH_DAYS))
     except Daily as e:
         log('⏸ Gemini\'s free daily limit: the next run continues', e)
+        FAIL[0] = 'Gemini\'s daily limit'
         return False
     return True
 
@@ -1185,7 +1257,9 @@ def rutube_kafedra(cfg, have, fresh_days=0):
     try:
         todo = [v for v in rutube_list() if 'rt:' + v['id'] not in have and not (v['dated'] and kkey(v['date'], v['speaker']) in have)]
         if fresh_days:  # v51: the new Кафедра only
-            todo = [v for v in todo if recent_date(v['date'], fresh_days) or pub_ts(v) > time.time() - fresh_days * 86400]  # v57: by when it came out on Rutube too (a late upload, or no date in its title)
+            fd = max(fresh_days, carry_days())
+            todo = [v for v in todo if recent_date(v['date'], fd) or pub_ts(v) > time.time() - fd * 86400]  # v57: by when it came out on Rutube too (a late upload, or no date in its title)
+            todo.sort(key=lambda v: carry_first('kafedra|' + v['date']))  # v57: the carried-over first
             try:  # v56: the QA checks each new Кафедра reached the library; v57: from its real publication time (the learner too)
                 for v in rutube_list():
                     if recent_date(v['date'], fresh_days) or pub_ts(v) > time.time() - fresh_days * 86400:
@@ -1220,9 +1294,11 @@ def rutube_kafedra(cfg, have, fresh_days=0):
                 have.add(kkey(v['date'], v['speaker']))
         except Daily as e:
             log('⏸', e)
+            FAIL[0] = 'Gemini\'s daily limit'
             raise
         except Exception as e:
             log('  ⚠️', str(e)[:160])
+            FAIL[0] = 'error: ' + str(e)[:60]
 
 
 # ---------------------------------------------------------------------- v43: a picture and a link for every Кафедра
@@ -1501,6 +1577,9 @@ def main():
         cfg['after'] = cfg['daily'] = True
     if cfg.get('after') and cfg.get('daily'):  # v56: the archive is closed: the church's daily messages, then the ministries, nothing else
         log('Daily mode: the church\'s new Кафедра, Горница and morning words (last %d days), then the ministries.' % FRESH_DAYS)
+        carry_load()  # v57: the carried-over church messages, first in this run
+        if CARRY:
+            log('↪️ carried over from earlier runs (made first): ' + ', '.join('%s (%s, %d runs)' % (k, v.get('why', ''), v.get('runs', 0)) for k, v in sorted(CARRY.items(), key=lambda x: x[1].get('since', 0))))
         tick('start')  # anything already waiting in faithBOT's queue is finished first
         cfg = bot('turbo_cfg') or cfg
         have = HAVE
@@ -1529,8 +1608,8 @@ def main():
             linger(cfg, have)  # v57: one due in the next half hour: waited for and made at once
         learn_seen()
         tick('end')
+        qa_report(cfg)  # v57: first, so the carried-over list is current in the report
         sched_report()
-        qa_report(cfg)
         quota_save()
         shutil.rmtree(TMP, ignore_errors=True)
         return
