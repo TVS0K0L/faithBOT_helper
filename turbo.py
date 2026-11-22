@@ -570,7 +570,7 @@ async def telegram(cfg, have, kinds=None, fresh_days=0):
             if not fresh_days:
                 kw['offset_date'] = before
             async for msg in client.iter_messages(entity, **kw):
-                if fresh_days and (time.time() - msg.date.timestamp()) > max(fresh_days, carry_days()) * 86400:
+                if fresh_days and (time.time() - msg.date.timestamp()) > (MORNING_DAYS if src['kind'] == 'morning' else max(fresh_days, carry_days())) * 86400:  # v58
                     break  # v51: the new recordings only (newest first); v57: as far back as a carried-over one
                 text = msg.message or ''
                 if fresh_days and (msg.video or post_link(msg)) and need.search(text) and not skip.search(text) and not re.match(r'^\s*Начинаем', text):
@@ -773,7 +773,7 @@ def recent_date(d, days):
         return False
 
 
-FRESH_DAYS = 10  # v56: the last ten days (what was missed since 13.11 included); v51: recordings this new are the church's new ones: done first, every hour, and sent to everyone
+FRESH_DAYS = 6  # v58: daily only: the Кафедра and Горница up to 6 days, the morning word a day (MORNING_DAYS); v56: the last ten days (what was missed since 13.11 included); v51: recordings this new are the church's new ones: done first, every hour, and sent to everyone
 
 
 def recent(date, days=None):
@@ -1118,6 +1118,14 @@ FAIL = ['']  # why this run could not make one (the last reason seen)
 def carry_load():
     CARRY.clear()
     CARRY.update(memo().get('carry') or {})
+    for k in list(CARRY):  # v58: daily only: a carried message older than its window is let go
+        try:
+            kind, date = k.split('|')[:2]
+            age = (datetime.now() - datetime.strptime(date, '%d.%m.%Y')).days
+            if age > (MORNING_DAYS if kind == 'morning' else FRESH_DAYS):
+                del CARRY[k]
+        except Exception:
+            pass
 
 
 def carry_save():
@@ -1126,10 +1134,13 @@ def carry_save():
     memo_save(m)
 
 
+MORNING_DAYS = 2  # v58: the morning word: its day or the day after
+
+
 def carry_days():
     """How far back the church is looked at: the usual ten days, or as far as the oldest carried message (21 at most)."""
     old = [datetime.strptime(k.split('|')[1], '%d.%m.%Y') for k in CARRY if re.match(r'^\w+\|\d\d\.\d\d\.\d{4}', k)]
-    return min(21, max([FRESH_DAYS] + [(datetime.now() - d).days + 2 for d in old]))
+    return min(FRESH_DAYS, max([FRESH_DAYS] + [(datetime.now() - d).days + 2 for d in old]))  # v58: never beyond the daily window
 
 
 def carry_first(key):
