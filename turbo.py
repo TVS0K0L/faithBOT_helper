@@ -1081,9 +1081,7 @@ def tick(where):
     trig = set(t.get('triggers') or [])
     if 'morningPrayer' not in trig:
         QA.append('⚠️ the hourly trigger is missing: run setup once')
-    mins = sum((t.get('minutes') or {}).values()) if isinstance(t.get('minutes'), dict) else 0
-    if mins > 70:
-        QA.append('⚠️ the bot\'s triggers used %d of Google\'s 90 daily minutes' % mins)
+    # v60.1: no warnings about Google's daily minutes (the bot paces itself)
     return t
 
 
