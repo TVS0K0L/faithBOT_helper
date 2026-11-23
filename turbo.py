@@ -1586,6 +1586,7 @@ def main():
         cfg['after'] = cfg['daily'] = True
     if cfg.get('after') and cfg.get('daily'):  # v56: the archive is closed: the church's daily messages, then the ministries, nothing else
         log('Daily mode: the church\'s new Кафедра, Горница and morning words (last %d days), then the ministries.' % FRESH_DAYS)
+        log('🔑 %d Gemini key(s) ready (each with its own free daily allowance)' % len(KEYS))
         carry_load()  # v57: the carried-over church messages, first in this run
         if CARRY:
             log('↪️ carried over from earlier runs (made first): ' + ', '.join('%s (%s, %d runs)' % (k, v.get('why', ''), v.get('runs', 0)) for k, v in sorted(CARRY.items(), key=lambda x: x[1].get('since', 0))))
