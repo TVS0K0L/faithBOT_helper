@@ -54,7 +54,13 @@ def bot(a, timeout=360, **body):
         try:
             r = requests.post(URL, params={'helper': '1', 'k': KEY}, data=json.dumps(body), timeout=600 if once else timeout,
                               headers={'Content-Type': 'text/plain;charset=utf-8'})
-            return r.json()
+            try:
+                return r.json()
+            except Exception:
+                txt = re.sub(r'<[^>]+>', ' ', r.text or '')
+                txt = re.sub(r'\s+', ' ', txt).strip()
+                log('faithBOT answered %s to %s, not JSON: %s' % (r.status_code, a, txt[:400]))  # what went wrong, in its own words
+                raise
         except Exception as e:
             log('faithBOT not reachable (%s)%s' % (str(e)[:80], '' if once else ', retrying'))
             if not once:
